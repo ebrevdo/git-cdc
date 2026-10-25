@@ -109,7 +109,9 @@ impl Manifest {
                 {
                     bail!("invalid manifest key: {key:?}");
                 }
-                header.insert(key.to_string(), value.to_string());
+                if header.insert(key.to_string(), value.to_string()).is_some() {
+                    bail!("duplicate manifest header key: {key:?}");
+                }
             }
         }
 

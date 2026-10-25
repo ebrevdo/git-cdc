@@ -1,7 +1,7 @@
 //! The clean/smudge filters: one-shot commands and the long-running
 //! filter-process protocol.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 
 use anyhow::{Result, bail};
 use git_cdc_core::chunker::{ChunkParams, chunk_stream};
@@ -80,15 +80,19 @@ pub fn cmd_clean(path: Option<&str>) -> Result<()> {
 }
 
 pub fn cmd_smudge() -> Result<()> {
-    let stdin = std::io::stdin().lock();
-    let stdout = std::io::stdout().lock();
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    if !crate::git::auto_hydrate()? {
+        std::io::copy(&mut stdin, &mut stdout)?;
+        return Ok(());
+    }
     smudge_stream(stdin, stdout, &local_store()?)
 }
 
 /// Long-running filter (gitattributes(5) filter-process protocol, v2): one
 /// process per git operation instead of one per file; store and chunk
 /// params are opened once.
-pub fn cmd_filter_process() -> Result<()> {
+pub fn cmd_filter_process(lfs: bool) -> Result<()> {
     use git_cdc_core::pktline::{PktReader, PktWriter, read_text, write_flush, write_text};
 
     let mut input = std::io::stdin().lock();
@@ -115,10 +119,19 @@ pub fn cmd_filter_process() -> Result<()> {
     write_text(&mut output, "capability=smudge")?;
     write_flush(&mut output)?;
 
-    let store = local_store()?;
+    enum FilterStore {
+        Disk(DiskStore),
+        Lfs(crate::lfs::Store),
+    }
+    let store = if lfs {
+        FilterStore::Lfs(crate::lfs::Store::new()?)
+    } else {
+        FilterStore::Disk(local_store()?)
+    };
     // Per-path, so a tracked file keeps the parameters it was committed with
     // even when this clone's `cdc.chunk.*` says otherwise.
     let mut params = ChunkParamsFor::new(chunk_params()?);
+    let hydrate = crate::git::auto_hydrate()?;
 
     // Per-file loop: keys, flush, content packets, flush.
     loop {
@@ -148,27 +161,40 @@ pub fn cmd_filter_process() -> Result<()> {
             bail!("filter request without a command");
         }
 
-        // Buffer the result so a mid-stream failure can still become a
-        // clean per-file status=error instead of a truncated success.
+        // Spool to disk so failed verification becomes status=error without
+        // emitting partial content or retaining an entire file in RAM.
         let mut content = PktReader::new(&mut input);
-        let mut result = Vec::new();
-        let outcome = match command.as_str() {
-            "clean" => clean_stream(
+        let mut result = tempfile::tempfile()?;
+        let outcome = match (command.as_str(), &store) {
+            ("smudge", _) if !hydrate => std::io::copy(&mut content, &mut result)
+                .map(|_| ())
+                .map_err(Into::into),
+            ("clean", FilterStore::Lfs(store)) => crate::lfs::clean(
                 &mut content,
                 &mut result,
-                &store,
+                store,
                 params.get(Some(pathname.as_str())),
             ),
-            "smudge" => smudge_stream(&mut content, &mut result, &store),
-            other => Err(anyhow::anyhow!("unsupported filter command {other:?}")),
+            ("smudge", FilterStore::Lfs(store)) => {
+                crate::lfs::smudge(&mut content, &mut result, store)
+            }
+            ("clean", FilterStore::Disk(store)) => clean_stream(
+                &mut content,
+                &mut result,
+                store,
+                params.get(Some(pathname.as_str())),
+            ),
+            ("smudge", FilterStore::Disk(store)) => smudge_stream(&mut content, &mut result, store),
+            (other, _) => Err(anyhow::anyhow!("unsupported filter command {other:?}")),
         };
         content.drain()?;
 
         match outcome {
             Ok(()) => {
+                result.rewind()?;
                 write_text(&mut output, "status=success")?;
                 write_flush(&mut output)?;
-                PktWriter::new(&mut output).write_all(&result)?;
+                std::io::copy(&mut result, &mut PktWriter::new(&mut output))?;
                 write_flush(&mut output)?;
                 write_flush(&mut output)?; // empty list: status unchanged
             }

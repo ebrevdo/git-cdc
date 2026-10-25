@@ -37,6 +37,24 @@ pub fn local_store() -> Result<DiskStore> {
     Ok(DiskStore::new(git_dir()?.join("cdc").join("objects")))
 }
 
+/// Explicit pointer-only checkout policy shared by both CDC filters.
+/// Transfer failures remain errors when hydration is enabled.
+pub fn auto_hydrate() -> Result<bool> {
+    let out = Git::new("git")
+        .args(["config", "--type=bool", "--get", "cdc.hydrate"])
+        .output()?;
+    if out.status.code() == Some(1) {
+        return Ok(true);
+    }
+    if !out.status.success() {
+        bail!(
+            "cannot read cdc.hydrate: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8(out.stdout)?.trim() == "true")
+}
+
 /// `cdc.chunk.{min,avg,max}` from git config, defaults where unset.
 /// `--type=int` expands git's k/m/g suffixes ("512k" → 524288).
 pub fn chunk_params() -> Result<ChunkParams> {
@@ -117,11 +135,13 @@ impl ChunkParamsFor {
     }
 
     fn committed(&mut self, path: &str) -> Option<ChunkParams> {
-        // A path with a newline cannot be addressed on cat-file's line
-        // protocol; such files just use the local config.
-        if path.contains('\n') {
-            return None;
-        }
+        // Address a newline-bearing path through argv, then send its object
+        // id on the batch protocol. It still inherits the index's parameters.
+        let revision = if path.contains('\n') {
+            git_out(&["rev-parse", "--verify", &format!(":{path}")]).ok()?
+        } else {
+            format!(":{path}")
+        };
         if self.batch.is_none() {
             let mut child = Git::new("git")
                 .args(["cat-file", "--batch"])
@@ -138,7 +158,7 @@ impl ChunkParamsFor {
         }
         let batch = self.batch.as_mut()?;
 
-        writeln!(batch.stdin, ":{path}").ok()?;
+        writeln!(batch.stdin, "{revision}").ok()?;
         batch.stdin.flush().ok()?;
         let mut header = String::new();
         batch.stdout.read_line(&mut header).ok()?;
@@ -152,8 +172,11 @@ impl ChunkParamsFor {
         let size = size as usize;
         if typ != "blob" || size as u64 > MAX_MANIFEST_SIZE {
             // Still must drain the body, or the stream desynchronises.
-            let mut body = vec![0u8; size + 1];
-            batch.stdout.read_exact(&mut body).ok()?;
+            std::io::copy(
+                &mut (&mut batch.stdout).take(size as u64 + 1),
+                &mut std::io::sink(),
+            )
+            .ok()?;
             return None;
         }
         let mut body = vec![0u8; size + 1]; // content + trailing LF
@@ -195,20 +218,25 @@ pub fn oid_str(hash: &blake3::Hash) -> String {
     format!("blake3:{}", hash.to_hex())
 }
 
-/// Every manifest blob across history (PLAN 5.2): `git rev-list --all
-/// --objects` for reachability, `cat-file --batch-check` to keep only
-/// plausibly-sized blobs, `cat-file --batch` to read and sniff them by
-/// their fixed first line — path/attribute matching would miss renamed
-/// or historical files.
+/// Every legacy manifest blob across history. Walk object IDs with rev-list,
+/// then inspect bounded blobs using cat-file. Recipe signatures identify
+/// historical and renamed files without relying on current attributes.
 pub fn all_manifests() -> Result<Vec<Manifest>> {
+    Ok(manifests_from(&["--all".into()])?
+        .into_iter()
+        .filter(|m| m.extra.get("storage").map(String::as_str) != Some("git-lfs-v1"))
+        .collect())
+}
+
+/// Read recipe metadata for a revision set, including both CDC backends.
+/// Used by local cache policy; legacy publication/GC keep their own filter.
+pub(crate) fn manifests_from(revisions: &[String]) -> Result<Vec<Manifest>> {
     use std::process::Stdio;
 
-    let list = git_out(&["rev-list", "--all", "--objects"])?;
-    let mut shas: Vec<&str> = list
-        .lines()
-        .filter_map(|l| l.split(' ').next())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut args = vec!["rev-list", "--objects", "--no-object-names"];
+    args.extend(revisions.iter().map(String::as_str));
+    let list = git_out(&args)?;
+    let mut shas: Vec<&str> = list.lines().filter(|s| !s.is_empty()).collect();
     shas.sort_unstable();
     shas.dedup();
 
@@ -240,14 +268,15 @@ pub fn all_manifests() -> Result<Vec<Manifest>> {
         let size: u64 = size
             .parse()
             .with_context(|| format!("bad cat-file header: {header:?}"))?;
+        if typ != "blob" || size > MAX_MANIFEST_SIZE {
+            std::io::copy(&mut (&mut from_git).take(size + 1), &mut std::io::sink())?;
+            continue;
+        }
         let mut body = vec![0u8; size as usize + 1]; // content + trailing LF
         from_git.read_exact(&mut body)?;
         body.pop();
-        if typ != "blob" || size > MAX_MANIFEST_SIZE || !is_manifest(&body) {
-            continue;
-        }
-        if let Ok(m) = Manifest::parse(&body) {
-            manifests.push(m);
+        if is_manifest(&body) {
+            manifests.push(Manifest::parse(&body)?);
         }
     }
     drop(to_git);

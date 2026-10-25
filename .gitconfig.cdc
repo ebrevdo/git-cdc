@@ -14,6 +14,11 @@
 
 # --- Remote: pick ONE of the modes below --------------------------------
 
+# Standard Git LFS storage (same repo, no CDC server): use
+# `git cdc install --lfs [--global]` and `git cdc track --lfs '*.bin'`.
+# It installs its required filter and pre-push integration; endpoint and
+# credentials use Git LFS configuration. See docs/book/src/lfs.md.
+
 # Mode 1: git-cdc-server (central auth, batch API)
 # [cdc]
 # 	url = http://your-server:8077

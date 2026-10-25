@@ -7,6 +7,8 @@ use git_cdc_core::manifest::Manifest;
 
 mod filter;
 mod git;
+mod lfs;
+mod lifecycle;
 mod remote;
 mod sync;
 
@@ -26,9 +28,32 @@ enum Cmd {
     Install {
         #[arg(long)]
         global: bool,
+        /// Use standard Git LFS storage and automatic checkout/push integration
+        #[arg(long)]
+        lfs: bool,
     },
     /// Add file patterns to .gitattributes
-    Track { patterns: Vec<String> },
+    Track {
+        #[arg(long)]
+        lfs: bool,
+        patterns: Vec<String>,
+    },
+    #[command(hide = true)]
+    LfsClean { path: Option<String> },
+    #[command(hide = true)]
+    LfsSmudge,
+    #[command(hide = true)]
+    LfsFilterProcess,
+    #[command(hide = true)]
+    LfsPrePush { remote: String, url: String },
+    #[command(hide = true)]
+    LfsTextconv { path: PathBuf },
+    #[command(hide = true)]
+    LfsDispatchHook {
+        hook: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     /// Clean filter: file content on stdin -> manifest on stdout.
     /// The path (git's `%f`) lets a tracked file keep the chunk parameters
     /// it was committed with; omitting it falls back to `cdc.chunk.*`.
@@ -47,7 +72,15 @@ enum Cmd {
         root: PathBuf,
     },
     /// Fetch chunks for the current checkout and materialize tracked files
-    Pull,
+    Pull {
+        /// Restore only these indexed CDC paths; omitted means all CDC paths
+        paths: Vec<String>,
+    },
+    /// Evict remotely backed local cache entries without changing working files
+    Prune {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Upload chunks referenced by any local manifest ahead of `git push`
     Push,
     /// Sweep unreferenced chunks from local and remote stores
@@ -84,13 +117,27 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Cmd::Install { global } => cmd_install(global),
-        Cmd::Track { patterns } => cmd_track(&patterns),
+        Cmd::Install { global, lfs: true } => lfs::install(global),
+        Cmd::Install { global, lfs: false } => cmd_install(global),
+        Cmd::Track { patterns, lfs } => {
+            if lfs || git_out(&["config", "--get", "cdc.storage"]).is_ok_and(|s| s == "lfs") {
+                lfs::track(&patterns)
+            } else {
+                cmd_track(&patterns)
+            }
+        }
+        Cmd::LfsClean { path } => lfs::cmd_clean(path.as_deref()),
+        Cmd::LfsSmudge => lfs::cmd_smudge(),
+        Cmd::LfsFilterProcess => filter::cmd_filter_process(true),
+        Cmd::LfsPrePush { remote, url } => lfs::pre_push(&remote, &url),
+        Cmd::LfsTextconv { path } => lfs::textconv(&path),
+        Cmd::LfsDispatchHook { hook, args } => lfs::dispatch_hook(&hook, &args),
         Cmd::Clean { path } => filter::cmd_clean(path.as_deref()),
         Cmd::Smudge => filter::cmd_smudge(),
-        Cmd::FilterProcess => filter::cmd_filter_process(),
+        Cmd::FilterProcess => filter::cmd_filter_process(false),
         Cmd::Stdio { root } => remote::cmd_stdio(&root),
-        Cmd::Pull => sync::cmd_pull(),
+        Cmd::Pull { paths } => lifecycle::pull(&paths),
+        Cmd::Prune { dry_run } => lifecycle::prune(dry_run),
         Cmd::Push => sync::cmd_push(),
         Cmd::Gc {
             dry_run,
@@ -101,7 +148,7 @@ fn main() -> Result<()> {
             all,
             chunks,
             dry_run,
-        } => sync::cmd_drop(&paths, all, chunks, dry_run),
+        } => lifecycle::drop_files(&paths, all, chunks, dry_run),
         Cmd::Diff { from, to } => match (from, to) {
             (Some(from), Some(to)) => cmd_diff(&from, &to),
             (None, None) => cmd_diff_repo(),
