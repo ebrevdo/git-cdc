@@ -31,9 +31,13 @@ certification of every hosted instance or every administrator's retention policy
 
 ## Implemented storage roots
 
-After each batch's required chunks have uploaded successfully, the backend
-prepares a Git commit containing ordinary SHA-256 LFS pointer files. It publishes that
+After the required chunks have uploaded successfully, the backend prepares a
+Git commit containing ordinary SHA-256 LFS pointer files. It publishes that
 commit under `refs/notes/git-cdc-lfs/<commit-id>` in the same Git repository.
+Pushes that recover no chunks combine all transfer batches in one retention
+publication. Cold migrations publish checkpoints before evicting recovered
+chunks, preserving the recovery disk budget. Existing roots are discovered once
+per push; each checkpoint extends the preceding publication.
 Only then does the pre-push hook allow Git to publish the user's ref updates.
 There is no additional server, repository, or tracked sidecar. User history is unchanged.
 
@@ -41,7 +45,7 @@ Previous remote retention roots become ancestors of the new root. Parent lists
 are reduced to their independent tips using Git's graph operations. Git
 fast-import creates the standard pointer blobs, tree and commit in one process;
 the user's index is never opened for writing. Sorted parents and a unique
-publication ID give each batch a fresh commit. Immutable ref names
+publication ID give each publication a fresh commit. Immutable ref names
 avoid a shared catalogue's lost-update problem. Concurrent publishers retain
 both roots; subsequent roots join their ancestry.
 
@@ -82,6 +86,13 @@ standard standalone-file transfer adapter:
 - An 80 MiB cold mirror to an independent file remote keeps each transfer batch
   within its byte budget and evicts fetched chunks after pinning, while retaining
   a pre-existing cache object.
+- An 80 MiB push with cached chunks performs one retention discovery and one
+  retention push, measured through Git Trace2 events. Its next push reuses
+  ancestry metadata with the chunk cache empty; the HTTP path negotiates the
+  already-present objects in one LFS client invocation.
+- Metadata-cache corruption and unrelated branches trigger a full scan. A
+  cached history still fails publication when a required chunk is missing both
+  locally and remotely.
 
 The collector is explicitly a local simulation using stock pointer discovery.
 A live GitLab deployment and its administrative cleanup job were not run.

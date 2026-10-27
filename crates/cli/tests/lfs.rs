@@ -16,6 +16,24 @@ use git_cdc_core::manifest::Manifest;
 const BIN: &str = env!("CARGO_BIN_EXE_git-cdc");
 const RETENTION_PREFIX: &str = "refs/notes/git-cdc-lfs";
 
+fn traced_git_commands(path: &Path) -> Vec<Vec<String>> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            (event["event"] == "start").then(|| {
+                event["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_owned())
+                    .collect()
+            })
+        })
+        .collect()
+}
+
 #[path = "lfs_support/proxy.rs"]
 mod proxy;
 
@@ -2109,6 +2127,181 @@ fn cold_cache_push_recovers_from_target_despite_origin_tracking() {
         fs::read(recovered.join("a.bin")).unwrap(),
         b"available only at the backup\n"
     );
+}
+
+#[test]
+fn warm_push_combines_retention_and_reuses_history_metadata() {
+    let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.chunk.min", "1m"]);
+    f.git(&f.repo, &["config", "cdc.chunk.avg", "4m"]);
+    f.git(&f.repo, &["config", "cdc.chunk.max", "8m"]);
+    let data = test_data(80 * 1024 * 1024, 461);
+    f.write("a.bin", &data);
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("many warm transfer batches");
+    let trace = f.temp.path().join("push-trace.jsonl");
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .env("GIT_CDC_TRACE", "1")
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let roots = f.refs(&f.remote, RETENTION_PREFIX);
+    let commands = traced_git_commands(&trace);
+    let discoveries = commands
+        .iter()
+        .filter(|args| {
+            args.iter().any(|arg| arg == "ls-remote")
+                && args
+                    .iter()
+                    .any(|arg| arg == &format!("{RETENTION_PREFIX}/*"))
+        })
+        .count();
+    let publications = commands
+        .iter()
+        .filter(|args| {
+            args.iter().any(|arg| arg == "--no-verify")
+                && args
+                    .iter()
+                    .any(|arg| arg.contains(&format!(":{RETENTION_PREFIX}/")))
+        })
+        .count();
+    println!(
+        "PERF warm bytes={} retention_discoveries={discoveries} retention_pushes={publications}",
+        data.len()
+    );
+    assert_eq!(
+        roots.len(),
+        1,
+        "warm batches must publish one combined root"
+    );
+    assert_eq!(discoveries, 1, "retention roots must be discovered once");
+    assert_eq!(publications, 1, "retention must use one Git push");
+    let chunks = f.objects().len();
+    f.write("note.txt", b"metadata-only update\n");
+    f.git(&f.repo, &["add", "note.txt"]);
+    f.commit("reuse complete ancestry metadata");
+    fs::remove_dir_all(f.repo.join(".git/cdc/lfs/objects")).unwrap();
+    let trace = f.temp.path().join("cold-push-trace.jsonl");
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_CDC_TRACE", "1")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("{chunks} reused, 1 excluded tips")),
+        "{stderr}"
+    );
+    println!("{stderr}");
+    if f.endpoint.is_some() {
+        let transfers = traced_git_commands(&trace)
+            .iter()
+            .filter(|args| args.windows(2).any(|pair| pair == ["lfs", "push"]))
+            .count();
+        assert_eq!(
+            transfers, 1,
+            "cold existing history needs one metadata negotiation"
+        );
+    }
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 2);
+    let clone = f.clone_repo("combined-retention");
+    assert_eq!(fs::read(clone.join("a.bin")).unwrap(), data);
+}
+
+#[test]
+fn warm_push_combines_multiple_object_batches() {
+    let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.chunk.min", "16k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.avg", "32k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.max", "64k"]);
+    let data = test_data(12 * 1024 * 1024, 463);
+    f.publish_file("a.bin", &data, "more than 128 distinct chunks");
+    assert!(f.objects().len() > 128, "exercise several transfer batches");
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 1);
+    let clone = f.clone_repo("multiple-warm-batches");
+    assert_eq!(fs::read(clone.join("a.bin")).unwrap(), data);
+}
+
+#[test]
+fn history_cache_never_substitutes_for_remote_availability() {
+    let f = Fixture::new();
+    f.publish_file("a.bin", b"must still exist remotely\n", "cached ancestry");
+    let published = f.git(&f.remote, &["rev-parse", "refs/heads/main"]);
+    let objects = f.objects();
+    f.write("note.txt", b"new commit with old chunk references\n");
+    f.git(&f.repo, &["add", "note.txt"]);
+    f.commit("remote content was lost");
+    fs::remove_dir_all(f.repo.join(".git/cdc/lfs/objects")).unwrap();
+    for path in objects.keys() {
+        fs::remove_file(path).unwrap();
+    }
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_CDC_TRACE", "1")
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("1 reused, 1 excluded tips"), "{stderr}");
+    assert_eq!(
+        f.git(&f.remote, &["rev-parse", "refs/heads/main"]),
+        published
+    );
+}
+
+#[test]
+fn history_cache_falls_back_for_corruption_and_unrelated_history() {
+    let f = Fixture::new();
+    f.publish_file("a.bin", b"first branch\n", "first branch");
+    let cache = f.repo.join(".git/cdc/lfs/history-v1.json");
+    fs::write(&cache, b"truncated cache").unwrap();
+    f.write("a.bin", b"second version\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("rebuild corrupt metadata");
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_CDC_TRACE", "1")
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0 reused, 0 excluded tips"));
+    f.git(&f.repo, &["checkout", "--orphan", "unrelated"]);
+    f.git(&f.repo, &["rm", "-rf", "."]);
+    f.write("note.txt", b"no CDC chunks on this branch\n");
+    f.git(&f.repo, &["add", "note.txt"]);
+    f.commit("unrelated history");
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_CDC_TRACE", "1")
+        .args(["push", "origin", "unrelated"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0 chunks, 0 reused, 0 excluded tips"));
 }
 
 #[test]

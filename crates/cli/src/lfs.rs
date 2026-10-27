@@ -17,6 +17,7 @@ use crate::git::{ChunkParamsFor, chunk_params, git_out, repo_root};
 
 pub(crate) mod cache;
 mod context;
+mod history;
 mod hooks;
 mod retention;
 mod transfer;
@@ -97,6 +98,15 @@ fn git_without_replacements() -> Command {
     let mut command = Command::new("git");
     command.env("GIT_NO_REPLACE_OBJECTS", "1");
     command
+}
+
+fn trace(phase: &str, started: std::time::Instant, detail: impl std::fmt::Display) {
+    if std::env::var_os("GIT_CDC_TRACE").is_some_and(|value| value != "0") {
+        eprintln!(
+            "git-cdc: {phase}: {detail}; {} ms",
+            started.elapsed().as_millis()
+        );
+    }
 }
 
 fn chunk_oid<'a>(m: &'a Manifest, c: &Chunk) -> Result<&'a str> {
@@ -441,10 +451,12 @@ pub fn track(patterns: &[String]) -> Result<()> {
 /// detached commits and tag targets. No index or worktree scan is involved.
 fn visit_manifests(
     tips: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
     mut visit: impl FnMut(Manifest) -> Result<()>,
 ) -> Result<()> {
     visit_blobs_with(
         tips,
+        excluded,
         is_manifest,
         |body| {
             let m = Manifest::parse(body)?;
@@ -459,6 +471,7 @@ fn visit_manifests(
 
 fn visit_blobs_with(
     tips: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
     matches: impl Fn(&[u8]) -> bool,
     mut visit: impl FnMut(&[u8]) -> Result<()>,
     mut command: impl FnMut() -> Command,
@@ -466,6 +479,9 @@ fn visit_blobs_with(
     let mut revisions = tempfile::tempfile()?;
     for tip in tips {
         writeln!(revisions, "{tip}")?;
+    }
+    for tip in excluded {
+        writeln!(revisions, "^{tip}")?;
     }
     revisions.rewind()?;
     let mut walk = command()
@@ -583,6 +599,7 @@ pub fn pre_push(remote: &str, url: &str) -> Result<()> {
         }
     }
     ordinary.rewind()?;
+    let started = std::time::Instant::now();
     let status = target
         .command()
         .args([
@@ -598,23 +615,14 @@ pub fn pre_push(remote: &str, url: &str) -> Result<()> {
         .stderr(Stdio::inherit())
         .status()?;
     ensure!(status.success(), "standard Git LFS pre-push failed");
+    trace("stock LFS pre-push", started, "completed");
     let mut objects = BTreeMap::new();
     if !tips.is_empty() {
         ensure!(
             git_out(&["rev-parse", "--is-shallow-repository"])? == "false",
             "cannot verify complete LFS history from a shallow repository; fetch --unshallow first"
         );
-        visit_manifests(&tips, |m| {
-            for c in &m.chunks {
-                transfer::add_object(
-                    &mut objects,
-                    chunk_oid(&m, c)?,
-                    c.length as u64,
-                    Some(c.hash),
-                )?;
-            }
-            Ok(())
-        })?;
+        objects = history::collect(&tips)?;
         if !managed_tips.is_empty() {
             retention::visit_objects(&managed_tips, |oid, size| {
                 transfer::add_object(&mut objects, oid, size, None)
@@ -622,7 +630,7 @@ pub fn pre_push(remote: &str, url: &str) -> Result<()> {
         }
     }
     if objects.is_empty() {
-        retention::publish(&target, &BTreeMap::new())
+        retention::Publication::new(&target)?.publish(&BTreeMap::new())
     } else {
         transfer::publish(&Store::new()?, &target, &objects)
     }

@@ -51,6 +51,7 @@ pub(super) fn visit_objects_with(
 ) -> Result<()> {
     visit_blobs_with(
         tips,
+        &BTreeSet::new(),
         |head| head.starts_with(LFS_POINTER_VERSION.as_bytes()),
         |body| {
             // Our managed roots always contain canonical three-line SHA-256
@@ -249,18 +250,51 @@ pub(super) fn stage(objects: &BTreeMap<String, u64>, parents: &[String]) -> Resu
         .context("missing retention commit mark")
 }
 
-pub(super) fn publish(target: &PushRemote, objects: &BTreeMap<String, u64>) -> Result<()> {
-    let parents = previous_roots(target)?;
-    if objects.is_empty() && parents.is_empty() {
-        return Ok(());
+/// Discover remote roots once per push. Checkpoints extend the last successful
+/// publication; concurrent publishers keep their own immutable refs reachable.
+pub(super) struct Publication<'a> {
+    target: &'a PushRemote,
+    parents: Vec<String>,
+}
+
+impl<'a> Publication<'a> {
+    pub fn new(target: &'a PushRemote) -> Result<Self> {
+        let started = std::time::Instant::now();
+        let parents = previous_roots(target)?;
+        super::trace(
+            "retention discovery",
+            started,
+            format_args!("{} independent roots", parents.len()),
+        );
+        Ok(Self { target, parents })
     }
-    let commit = stage(objects, &parents)?;
+
+    pub fn publish(&mut self, objects: &BTreeMap<String, u64>) -> Result<()> {
+        if objects.is_empty() && self.parents.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let commit = stage(objects, &self.parents)?;
+        super::trace(
+            "retention preparation",
+            started,
+            format_args!("{} pointers", objects.len()),
+        );
+        let started = std::time::Instant::now();
+        publish_commit(self.target, &commit)?;
+        super::trace(
+            "retention publication",
+            started,
+            format_args!("{} pointers", objects.len()),
+        );
+        self.parents = vec![commit];
+        Ok(())
+    }
+}
+
+fn publish_commit(target: &PushRemote, commit: &str) -> Result<()> {
     let reference = format!("{PREFIX}{commit}");
-    git_out(&["update-ref", &reference, &commit])?;
-    ensure!(
-        !parents.contains(&commit),
-        "retention root must advance its ancestry"
-    );
+    git_out(&["update-ref", &reference, commit])?;
     // The outer operation has already run the user's hook and transferred all
     // required chunks. Bypass only the client's recursive pre-push invocation;
     // preserve server hooks and normal ref policies. Never force-update a pin.
@@ -288,7 +322,7 @@ pub(super) fn publish(target: &PushRemote, objects: &BTreeMap<String, u64>) -> R
             .output()?;
         ensure!(
             raced.status.success()
-                && String::from_utf8(raced.stdout)?.split_whitespace().next() == Some(&commit),
+                && String::from_utf8(raced.stdout)?.split_whitespace().next() == Some(commit),
             "cannot publish LFS retention metadata; user refs were not published"
         );
     }

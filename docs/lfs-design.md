@@ -71,12 +71,20 @@ blobs. Newline-bearing paths resolve through an argv-based object lookup before
 using the existing batch protocol.
 
 The pre-push hook uses Git's supplied local object IDs, not HEAD, worktree
-attributes or the current index. It walks all their ancestors without excluding
-remote-tracking refs: remote Git reachability is not proof of remote LFS
-availability. Tag targets and commits no longer on a branch are included.
+attributes or the current index. It collects the chunks from all their ancestors
+without treating remote-tracking refs as proof of remote LFS availability.
+Tag targets and commits no longer on a branch are included.
 Blobs are inspected through bounded reads. An oversized recognizable recipe
 fails publication. Recipe scanning collects IDs, sizes and chunk hashes without
 reassembling historical files. Whole-file verification remains in clean/checkout.
+The Git common directory's `cdc/lfs/history-v1.json` caches the last scan's tips
+and validated chunk IDs, lengths and BLAKE3 hashes. Its version and checksum
+detect stale formats and incomplete or damaged writes. Reuse requires every
+cached tip to be an ancestor of a supplied tip; Git then walks only the added
+objects. Missing objects, unrelated histories and invalid cache files cause a
+full scan. Writes use atomic replacement, so concurrent pushes may lose a cache
+optimization without losing required metadata. The cache stores no remote
+availability result: all collected chunks are negotiated on every push.
 The transfer session negotiates pointer metadata through the installed Git LFS
 client before fetching absent content. Ref deletion requires no chunk transfer.
 The hook also runs the stock LFS pre-push handler, using its ordinary cache for normal LFS
@@ -85,10 +93,13 @@ before storage transfer. A subsequent storage-only push publishes standard
 pointer roots under `refs/notes/git-cdc-lfs/`; it bypasses recursive client
 pre-push execution while preserving server-side hooks and ref policies.
 
-Transfers are limited to 128 objects and 64 MiB per batch, with oversized chunks
-handled individually. A private pointer-only worktree lets the stock client
-negotiate using IDs and sizes even with no cached content. Failed cold batches
-are split until missing objects can be recovered and retried; errors are never
+Transfers negotiate at most 128 objects per batch. A private pointer-only
+worktree lets the stock client negotiate using IDs and sizes even with no
+cached content. The recovery budget is 64 MiB of missing local content, with
+oversized chunks handled individually. HTTP batches exceeding that budget try
+metadata negotiation first; if all objects already exist remotely, no recovery
+or smaller batch is needed. Failed cold batches are split until missing objects
+can be recovered and retried within the budget; errors are never
 parsed from translated diagnostic text. Local-file transfers use the installed
 `git lfs standalone-file` adapter's JSON protocol so it can check the destination
 before requiring a source file. Explicit custom standalone adapters retain the
@@ -99,13 +110,21 @@ Preparation exports commit IDs without writing refs or running reference hooks;
 actual publication runs the user's hooks after releasing object leases. Roots
 have sorted parents, fixed identities/dates, and a unique publication ID to keep
 each root outside a mirror's negotiated updates. Each new root retains previous
-remote roots via Git ancestry. The ancestry frontier is reduced in bounded argument batches;
+remote roots via Git ancestry. Existing roots are discovered once per push;
+later checkpoints extend the last successful publication. The ancestry frontier
+is reduced in bounded argument batches;
 missing metadata is fetched without changing FETCH_HEAD or user refs. A fresh
 immutable name prevents a mirror push's already-negotiated deletions from
 removing the new root, even when Git provides no deletion updates to pre-push.
 A failed retention publication blocks user refs. This adds metadata preparation
-to dry runs, while leaving user branches and tags untouched. After a batch's
-root succeeds, only chunks fetched by that transfer session are evicted.
+to dry runs, while leaving user branches and tags untouched. Transfer batches
+accumulate pointers for one final root unless recovered chunks need a checkpoint
+before eviction. Only chunks fetched by that transfer session are evicted, after
+their checkpoint succeeds. User hooks run with no chunk leases held.
+
+`GIT_CDC_TRACE=1` reports phase durations and object counts for history collection,
+verification, transfers and retention, plus the stock LFS pre-push handler. It
+also reports how many chunk records came from the history metadata cache.
 
 ## Failure and concurrency model
 
@@ -139,8 +158,8 @@ content extension alone does not teach the stock pointer scanner about nested
 chunk dependencies. The per-file recipe plus existing pre-push integration
 keeps those dependencies explicit without altering commits.
 
-The tradeoffs are a CDC-aware client, complete-history push scans, a conservative
-metadata cap, temporary disk usage, binary hunk/merge semantics, no CDC-specific
+The tradeoffs are a CDC-aware client, complete-history scans on cache misses,
+a conservative metadata cap, temporary disk usage, binary hunk/merge semantics, no CDC-specific
 garbage collection, internal retention-ref publication, and Git's own checkout
 buffering. All-ref pointer discovery now sees standard pointers through the
 retention roots. Policies excluding those refs still need host-specific review.

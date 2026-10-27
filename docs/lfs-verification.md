@@ -34,8 +34,8 @@ suites, including the HTTP-only tests.
 
 | Check | Result |
 |---|---|
-| Workspace regression suite | 153 passed, 0 failed; 2 HTTP-only tests ignored |
-| Full LFS suite with reference HTTP server | 62 passed, 0 failed, 0 ignored |
+| Workspace regression suite | 157 passed, 0 failed; 2 HTTP-only tests ignored |
+| Full LFS suite with reference HTTP server | 66 passed, 0 failed, 0 ignored |
 | Lifecycle regressions on Git LFS 3.8.1 | 23 passed, 0 failed |
 | Clippy, all targets, warnings denied | Passed |
 | Rust formatting | Passed |
@@ -44,6 +44,15 @@ suites, including the HTTP-only tests.
 These counts describe test executions, not distinct proofs: the explicit
 reference-server test repeats the main history-recovery workflow. The original
 backend, core and server regression tests remain included in the workspace run.
+
+Push-bookkeeping regressions cover one combined retention root across several
+128-object transfer batches, ancestry-cache reuse, corrupt-cache fallback,
+unrelated histories, and missing remote content despite cached metadata. Git
+Trace2 records one retention discovery and one retention push for an 80 MiB
+fixture. With its local chunks removed, the next HTTP push reuses 19 chunk
+records and completes one LFS client invocation without downloading content.
+These are local regression measurements; the production migration's push time
+has not been measured with this implementation.
 
 ### Publication regression checks, October 26, 2026
 
@@ -131,10 +140,12 @@ rejection is tested to fail closed before user refs are published.
 
 Storage preparation, including internal refs, can occur during a dry run or
 remain after an unsuccessful outer push. User branches/tags are unchanged by
-that preparation. Internal refs can appear in explicit all-ref logs. Metadata
-and cache GC are not implemented; complete-history scans and metadata-ref
-ancestry add push cost. Unverified host-specific policies remain outside the
-retention guarantee.
+that preparation. Internal refs can appear in explicit all-ref logs.
+Retention-metadata GC is not implemented. Cache misses still scan complete
+history, and every push negotiates remote chunk availability. Warm pushes
+combine retention updates; cold migrations checkpoint recovered chunks before
+eviction. Metadata-ref ancestry still adds push cost. Unverified host-specific
+policies remain outside the retention guarantee.
 
 CDC paths use binary hunk/merge semantics. Shallow non-deletion pushes remain
 restricted. Legacy CDC history stays in its original backend. Client hook

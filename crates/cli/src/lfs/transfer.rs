@@ -16,8 +16,8 @@ const BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const BATCH_OBJECTS: usize = 128;
 
 pub(super) struct Object {
-    size: u64,
-    hash: Option<blake3::Hash>,
+    pub size: u64,
+    pub hash: Option<blake3::Hash>,
 }
 
 pub(super) fn add_object(
@@ -56,21 +56,22 @@ pub(super) fn publish(
         store,
         target,
         file: FileUpload::start(store, target)?,
+        publication: retention::Publication::new(target)?,
+        pending: BTreeMap::new(),
     };
     let mut batch = Vec::new();
-    let mut bytes = 0;
     for (oid, object) in objects {
-        if !batch.is_empty() && (batch.len() == BATCH_OBJECTS || bytes + object.size > BATCH_BYTES)
-        {
+        if batch.len() == BATCH_OBJECTS {
             session.publish_batch(&batch)?;
             batch.clear();
-            bytes = 0;
         }
         batch.push((oid.as_str(), object));
-        bytes += object.size;
     }
     if !batch.is_empty() {
         session.publish_batch(&batch)?;
+    }
+    if !session.pending.is_empty() {
+        session.publication.publish(&session.pending)?;
     }
     Ok(())
 }
@@ -79,6 +80,8 @@ struct TransferSession<'a> {
     store: &'a Store,
     target: &'a PushRemote,
     file: Option<FileUpload>,
+    publication: retention::Publication<'a>,
+    pending: BTreeMap<String, u64>,
 }
 
 impl TransferSession<'_> {
@@ -89,18 +92,73 @@ impl TransferSession<'_> {
             .iter()
             .map(|(oid, _)| self.store.lease(oid, false))
             .collect::<Result<Vec<_>>>()?;
+        let missing_bytes: u64 = batch
+            .iter()
+            .filter(|(oid, _)| !self.store.path(oid).is_file())
+            .map(|(_, object)| object.size)
+            .sum();
+        let started = std::time::Instant::now();
         for (oid, object) in batch {
             if self.store.path(oid).is_file() {
                 self.verify(oid, object)?;
             }
         }
+        super::trace(
+            "LFS verification",
+            started,
+            format_args!("{} objects", batch.len()),
+        );
+        if missing_bytes > BATCH_BYTES && batch.len() > 1 {
+            // Cold history often already exists remotely. Negotiate metadata
+            // first, keeping credentials in one client for up to 128 objects.
+            // Only failed negotiations need smaller recovery batches.
+            let started = std::time::Instant::now();
+            if self.file.is_none() {
+                let result = self.upload_with_client(batch)?;
+                super::trace(
+                    "LFS transfer",
+                    started,
+                    format_args!(
+                        "{} objects, 0 recovered, negotiation {}",
+                        batch.len(),
+                        if result.status.success() {
+                            "completed"
+                        } else {
+                            "requires recovery"
+                        }
+                    ),
+                );
+                if result.status.success() {
+                    self.pending.extend(pointer_objects(batch));
+                    return Ok(());
+                }
+            }
+            // Check the budget under leases: concurrent eviction must not turn
+            // a warm plan into an unbounded download.
+            drop(leases);
+            let (first, second) = batch.split_at(batch.len() / 2);
+            self.publish_batch(first)?;
+            return self.publish_batch(second);
+        }
         let mut fetched = Vec::new();
+        let started = std::time::Instant::now();
         self.upload(batch, &mut fetched)?;
-        let pointers = pointer_objects(batch);
+        super::trace(
+            "LFS transfer",
+            started,
+            format_args!("{} objects, {} recovered", batch.len(), fetched.len()),
+        );
+        self.pending.extend(pointer_objects(batch));
         // Publication invokes user reference-transaction/server hooks. Chunk
         // bytes are no longer in use, so release leases before those hooks run.
         drop(leases);
-        retention::publish(self.target, &pointers)?;
+        // Warm pushes combine all pointers in one root. A cold transfer must
+        // pin recovered bytes before evicting them to respect its disk budget.
+        if fetched.is_empty() {
+            return Ok(());
+        }
+        self.publication.publish(&self.pending)?;
+        self.pending.clear();
         // Keep pre-existing and unpublished cache entries. Only content fetched
         // by this session is evicted, after its remote retention pin succeeds.
         for oid in fetched {

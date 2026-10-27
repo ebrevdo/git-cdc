@@ -123,11 +123,13 @@ historical cache entries. Dry runs are available for drop and prune.
 
 ## Publication, recovery, and cache
 
-Before Git publishes refs, the hook walks the complete Git ancestry of the
-actual tips supplied by Git, including tag-only history and detached-HEAD
-pushes. Replacement objects are ignored because Git publishes the original
-objects. Each pre-push invocation binds transfers and retention publication to
-the destination supplied by Git, including remotes with multiple push URLs;
+Before Git publishes refs, the hook collects the chunks required by the complete
+ancestry of the actual tips supplied by Git, including tag-only history and
+detached-HEAD pushes. A local metadata cache lets later pushes scan only the
+history added since the cached tips. Cache loss, corruption, or unrelated history
+causes a full scan. Replacement objects are ignored because Git publishes the
+original objects. Each pre-push invocation binds transfers and retention
+publication to the destination supplied by Git, including remotes with multiple push URLs;
 explicit LFS endpoint settings still apply. It validates recipe structure and
 collects chunk IDs and sizes without reconstructing historical files.
 Whole-file hashes are computed when cleaning
@@ -137,12 +139,23 @@ content. Objects already at the destination need no local copy. Missing chunks
 are restored from the normal download remote, then the target if necessary.
 Cached and fetched chunks are checked before upload.
 
-Transfers use batches of at most 128 objects and 64 MiB; an object larger than
-64 MiB travels alone. Each completed batch gets a retention root before chunks
-downloaded by that push are evicted. Existing cache entries remain untouched.
+Transfers negotiate at most 128 objects at a time. Recovery batches are limited
+to 64 MiB of missing local content; an object larger than 64 MiB travels alone.
+Cached chunks and chunks already at the destination need no recovery budget.
+Pushes that recover no chunks combine their retention pointers into one root.
+A cold migration publishes checkpoints before evicting downloaded chunks to
+keep disk use bounded. Existing cache entries remain untouched. Each push
+discovers existing retention roots once; checkpoints extend the preceding root.
 Object leases coordinate readers, cleans and eviction across linked worktrees.
 Failures block user ref publication and can leave uploaded objects or completed
 retention roots. Retries negotiate again, without an 'already uploaded' ledger.
+The metadata cache records validated recipe information, never remote presence.
+Every push still checks all required chunks at its actual LFS destination.
+
+Use `GIT_CDC_TRACE=1 git push ...` to print phase timings for the stock LFS hook,
+history collection, local chunk verification, LFS transfers, retention discovery,
+and retention preparation/publication. History timings include the number of
+chunks reused from the metadata cache.
 
 After successful transfer, it publishes an internal retention root under
 `refs/notes/git-cdc-lfs/`. Its Git tree contains ordinary LFS pointers for the
@@ -210,8 +223,9 @@ metadata/refs can grow with pushes, and there is no retention-metadata GC yet.
   unmodified remote. Install the integration on every publishing computer.
 - A shallow repository cannot validate the complete published ancestry; the
   hook refuses non-deletion pushes until `git fetch --unshallow` succeeds.
-- Every push scans metadata throughout reachable history for the supplied
-  tips. A cold push downloads only objects the destination needs, using bounded
+- A cache miss scans metadata throughout reachable history for the supplied
+  tips. Incremental pushes reuse validated metadata for cached ancestors.
+  A cold push downloads only objects the destination needs, using bounded
   batches. For HTTP/SSH, failed cold batches are split to identify missing
   content through the stock client's exit status. This can add process and
   negotiation overhead. A required object unavailable locally and from the
