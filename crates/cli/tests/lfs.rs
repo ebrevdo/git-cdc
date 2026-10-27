@@ -760,6 +760,32 @@ fn missing_and_corrupt_data_block_checkout_and_push_without_emitting_bytes() {
 }
 
 #[test]
+fn small_files_stay_in_git_and_never_become_lfs_objects() {
+    let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.smallFileMax", "1m"]);
+    let small = test_data(4096, 131);
+    let large = test_data(3 * 1024 * 1024, 132);
+    f.write("small.bin", &small);
+    f.write("large.bin", &large);
+    f.git(&f.repo, &["add", "small.bin", "large.bin"]);
+    f.commit("small and large files");
+    let stored = f.run(&f.repo, &["cat-file", "blob", "HEAD:small.bin"]);
+    assert!(stored.status.success());
+    assert_eq!(stored.stdout, small, "small files are plain Git blobs");
+    let manifest = f.manifest("HEAD:large.bin");
+    let chunks = manifest
+        .extra
+        .keys()
+        .filter(|key| key.starts_with("lfs."))
+        .count();
+    f.push();
+    assert_eq!(f.objects().len(), chunks, "only the large file uses LFS");
+    let clone = f.clone_repo("small-files-clone");
+    assert_eq!(fs::read(clone.join("small.bin")).unwrap(), small);
+    assert_eq!(fs::read(clone.join("large.bin")).unwrap(), large);
+}
+
+#[test]
 fn version_prefixed_content_is_chunked_and_old_raw_blobs_smudge_unchanged() {
     for one_shot in [false, true] {
         let f = Fixture::new();

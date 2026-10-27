@@ -59,6 +59,29 @@ pub fn auto_hydrate() -> Result<bool> {
     Ok(String::from_utf8(out.stdout)?.trim() == "true")
 }
 
+/// Largest `cdc.smallFileMax`: clean buffers a small file in memory to learn
+/// that it ends before the limit.
+pub const SMALL_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// `cdc.smallFileMax` from git config: files of at most this many bytes are
+/// stored as plain Git blobs instead of recipes. Unset or 0 disables it.
+pub fn small_file_max() -> Result<u64> {
+    let key = "cdc.smallFileMax";
+    if git_out(&["config", "--get", key]).is_err() {
+        return Ok(0); // unset — a malformed value must NOT land here
+    }
+    let v = git_out(&["config", "--type=int", "--get", key])?;
+    let max = v
+        .parse::<u64>()
+        .ok()
+        .with_context(|| format!("{key} = {v:?} is not a valid size"))?;
+    ensure!(
+        max <= SMALL_FILE_LIMIT,
+        "{key} = {max} exceeds the 16 MiB limit"
+    );
+    Ok(max)
+}
+
 /// `cdc.chunk.{min,avg,max}` from git config, defaults where unset.
 /// `--type=int` expands git's k/m/g suffixes ("512k" → 524288).
 pub fn chunk_params() -> Result<ChunkParams> {
@@ -94,6 +117,9 @@ const PER_PATH_LOOKUPS: usize = 64;
 /// already has. Untracked (new) files, and repos with `cdc.chunk.inherit`
 /// set false, use the local config.
 ///
+/// The same lookup decides whether a small file is stored as a plain blob
+/// (`cdc.smallFileMax`): a file already committed as a recipe keeps one.
+///
 /// The first lookups query each path; a filter process that keeps going then
 /// snapshots the active index once, so later new paths need no Git request.
 /// Long-lived helpers check object sizes before reading candidate recipes;
@@ -101,12 +127,22 @@ const PER_PATH_LOOKUPS: usize = 64;
 pub struct ChunkParamsFor {
     local: ChunkParams,
     inherit: bool,
+    small_max: u64,
     snapshot_index: bool,
     lookups: usize,
     index: Option<HashMap<Vec<u8>, String>>,
-    cached: HashMap<String, Option<ChunkParams>>,
+    cached: HashMap<String, Committed>,
     check: Option<CatFile>,
     batch: Option<CatFile>,
+}
+
+/// What the active index holds for a path.
+#[derive(Clone, Copy)]
+enum Committed {
+    /// A recipe; `None` if its recorded parameters are unusable.
+    Recipe(Option<ChunkParams>),
+    /// A new path, or ordinary Git content (including oversized blobs).
+    Plain,
 }
 
 struct CatFile {
@@ -116,7 +152,7 @@ struct CatFile {
 }
 
 impl ChunkParamsFor {
-    pub fn new(local: ChunkParams) -> ChunkParamsFor {
+    pub fn new(local: ChunkParams, small_max: u64) -> ChunkParamsFor {
         // Opt-out for anyone deliberately re-chunking a repo to new settings.
         let inherit = git_out(&["config", "--type=bool", "--get", "cdc.chunk.inherit"])
             .map(|v| v != "false")
@@ -124,6 +160,7 @@ impl ChunkParamsFor {
         ChunkParamsFor {
             local,
             inherit,
+            small_max,
             snapshot_index: false,
             lookups: 0,
             index: None,
@@ -133,8 +170,8 @@ impl ChunkParamsFor {
         }
     }
 
-    pub fn for_process(local: ChunkParams) -> Self {
-        let mut params = Self::new(local);
+    pub fn for_process(local: ChunkParams, small_max: u64) -> Self {
+        let mut params = Self::new(local, small_max);
         params.snapshot_index = true;
         params
     }
@@ -148,30 +185,59 @@ impl ChunkParamsFor {
         let Some(path) = path.filter(|p| !p.is_empty()) else {
             return self.local;
         };
-        self.committed(path).unwrap_or(self.local)
+        match self.committed(path) {
+            Committed::Recipe(Some(params)) => params,
+            _ => self.local,
+        }
     }
 
-    fn committed(&mut self, path: &str) -> Option<ChunkParams> {
+    /// `cdc.smallFileMax`; 0 disables plain storage.
+    pub fn small_file_max(&self) -> u64 {
+        self.small_max
+    }
+
+    /// Whether clean should store `size` bytes for `path` as a plain Git blob.
+    /// A file already committed as a recipe keeps its recipe, so enabling the
+    /// setting never makes existing files look modified; `cdc.chunk.inherit
+    /// false` converts them. An unknown path (filters predating `%f`) never
+    /// switches representation.
+    pub fn stores_plain(&mut self, path: Option<&str>, size: u64) -> bool {
+        if self.small_max == 0 || size > self.small_max {
+            return false;
+        }
+        let Some(path) = path.filter(|p| !p.is_empty()) else {
+            return false;
+        };
+        !self.inherit || matches!(self.committed(path), Committed::Plain)
+    }
+
+    fn committed(&mut self, path: &str) -> Committed {
         let oid = if self.snapshot_index && self.lookups >= PER_PATH_LOOKUPS {
             let index = self
                 .index
                 .get_or_insert_with(|| index_oids().unwrap_or_default());
-            index.get(path.as_bytes())?.clone()
+            match index.get(path.as_bytes()) {
+                Some(oid) => oid.clone(),
+                None => return Committed::Plain,
+            }
         } else {
             // Small operations (and one-shot filters) look up each path, so
             // adding a few files to a large repo never lists its whole index.
             self.lookups += 1;
             if path.contains('\n') {
-                git_out(&["rev-parse", "--verify", &format!(":{path}")]).ok()?
+                match git_out(&["rev-parse", "--verify", &format!(":{path}")]) {
+                    Ok(oid) => oid,
+                    Err(_) => return Committed::Plain,
+                }
             } else {
                 format!(":{path}")
             }
         };
-        if let Some(params) = self.cached.get(&oid) {
-            return *params;
+        if let Some(committed) = self.cached.get(&oid) {
+            return *committed;
         }
-        let params = match self.read_params(&oid) {
-            Ok(params) => params,
+        let committed = match self.read_committed(&oid) {
+            Ok(committed) => committed,
             Err(_) => {
                 // A truncated response must not desynchronize later lookups.
                 if let Some(batch) = self.batch.take() {
@@ -180,7 +246,7 @@ impl ChunkParamsFor {
                 if let Some(check) = self.check.take() {
                     check.close();
                 }
-                None
+                Committed::Plain
             }
         };
         // Bound this cache independently of repository size. Identical recipes
@@ -188,11 +254,11 @@ impl ChunkParamsFor {
         if self.cached.len() >= 4096 {
             self.cached.clear();
         }
-        self.cached.insert(oid, params);
-        params
+        self.cached.insert(oid, committed);
+        committed
     }
 
-    fn read_params(&mut self, oid: &str) -> Result<Option<ChunkParams>> {
+    fn read_committed(&mut self, oid: &str) -> Result<Committed> {
         if self.check.is_none() {
             self.check = Some(CatFile::spawn("--batch-check")?);
         }
@@ -200,12 +266,12 @@ impl ChunkParamsFor {
         let mut parts = header.split_whitespace();
         let (name, typ, size) = (parts.next(), parts.next(), parts.next());
         if typ != Some("blob") {
-            return Ok(None);
+            return Ok(Committed::Plain);
         }
         let oid = name.context("missing blob ID")?;
         let size: u64 = size.context("missing blob size")?.parse()?;
         if size > MAX_MANIFEST_SIZE {
-            return Ok(None);
+            return Ok(Committed::Plain);
         }
         if self.batch.is_none() {
             self.batch = Some(CatFile::spawn("--batch")?);
@@ -215,17 +281,19 @@ impl ChunkParamsFor {
         batch.stdin.flush()?;
         let body = read_blob(&mut batch.stdout, oid, size)?;
         let Some(m) = detect(&body) else {
-            return Ok(None);
+            return Ok(Committed::Plain);
         };
         // A manifest committed with values fastcdc rejects must not be
         // inherited — chunking on them is undefined in a release build.
-        Ok(ChunkParams {
-            min: m.chunk_min,
-            avg: m.chunk_avg,
-            max: m.chunk_max,
-        }
-        .validate()
-        .ok())
+        Ok(Committed::Recipe(
+            ChunkParams {
+                min: m.chunk_min,
+                avg: m.chunk_avg,
+                max: m.chunk_max,
+            }
+            .validate()
+            .ok(),
+        ))
     }
 }
 

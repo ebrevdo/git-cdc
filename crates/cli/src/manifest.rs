@@ -47,6 +47,23 @@ pub(crate) fn read_candidate(
     Ok((prefix, Some(manifest)))
 }
 
+/// Extend `prefix` (already read from `reader`) by at most `max + 1 - len`
+/// bytes. Returns the buffered bytes and whether the whole input fit within
+/// `max`; otherwise the caller replays them ahead of the rest of `reader`.
+pub(crate) fn read_small(
+    reader: &mut impl BufRead,
+    mut prefix: Vec<u8>,
+    max: u64,
+) -> Result<(Vec<u8>, bool)> {
+    if max == 0 || prefix.len() as u64 > max {
+        return Ok((prefix, false));
+    }
+    let remaining = max + 1 - prefix.len() as u64;
+    (&mut *reader).take(remaining).read_to_end(&mut prefix)?;
+    let complete = prefix.len() as u64 <= max;
+    Ok((prefix, complete))
+}
+
 #[cfg(test)]
 mod boundary_tests {
     use std::io::{self, BufReader, Cursor};

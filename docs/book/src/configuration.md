@@ -98,3 +98,26 @@ would reject is ignored rather than inherited.
 Nothing here affects correctness: reassembly goes by chunk hash, so `pull` and
 `checkout` reproduce exact bytes whatever the parameters were. What is at
 stake is dedup.
+
+### Small files
+
+A file smaller than the minimum chunk size is always one chunk, so chunking it
+saves nothing and adds a stored object per file. `cdc.smallFileMax` keeps new
+files up to that size as ordinary Git blobs, for both backends:
+
+```sh
+git config cdc.smallFileMax 1m   # 0 (the default) disables it; at most 16 MiB
+```
+
+Clean buffers such a file in memory to check its size, which is why the limit
+is capped. The same inheritance rule as `cdc.chunk.*` applies: a file already
+committed as a manifest keeps one, so turning this on never makes existing
+files look modified, and a plain file that grows past the limit becomes a
+manifest. To convert existing small manifests, re-add them with inheritance
+off and commit:
+
+```sh
+git -c cdc.chunk.inherit=false add --renormalize .
+```
+
+Use the same value on every clone, for the same reason as the chunk settings.

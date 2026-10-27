@@ -68,3 +68,8 @@
 # 	min = 64k      ; 64 B – 1 MiB
 # 	avg = 256k     ; 256 B – 4 MiB
 # 	max = 1m       ; 1 KiB – 16 MiB, and min <= avg <= max
+#
+# Keep new files up to this size as ordinary Git blobs (0/unset = off,
+# at most 16 MiB). Files already committed as manifests keep them.
+# [cdc]
+# 	smallFileMax = 1m

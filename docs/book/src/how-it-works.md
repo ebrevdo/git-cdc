@@ -70,7 +70,9 @@ cheap.
 stdin, chunks it, writes each chunk into the local store, and emits the
 manifest — which is what git actually commits. If the input is *already* a
 manifest (a fresh-clone worktree that was never materialized), it passes
-through unchanged rather than chunking the manifest text itself.
+through unchanged rather than chunking the manifest text itself. With
+`cdc.smallFileMax` set, a new file no larger than that is also passed through
+and committed as an ordinary Git blob.
 
 **smudge** (runs on checkout): reads a manifest from stdin and emits the
 reassembled file. Three outcomes:

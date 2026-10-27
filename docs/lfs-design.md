@@ -56,7 +56,10 @@ with Git plumbing is checked during checkout, rather than publication.
 
 `clean` consumes bytes from Git, writes verified immutable chunks to the common
 cache, and returns exactly one recipe. Re-cleaning a valid recipe preserves it
-byte-for-byte. It never stages a sidecar or changes a ref. `smudge` fetches any
+byte-for-byte. With `cdc.smallFileMax`, a new file up to that size is returned
+unchanged instead, as an ordinary Git blob that creates no LFS object; a path
+already committed as a recipe keeps one. It never stages a sidecar or changes
+a ref. `smudge` fetches any
 missing chunks and returns the original file. Required-filter failures abort
 Git instead of claiming a complete checkout. Filter-process output uses an
 anonymous temporary file until the operation succeeds, also fixing the legacy

@@ -254,6 +254,18 @@ clients of a repo should use the same values, otherwise re-cleaning the same
 content on different machines produces different (equally valid) manifests,
 which shows up as spurious diffs. Set them repo-locally, not `--global`.
 
+Tiny files gain nothing from chunking, and each one costs a separate chunk
+object. To keep them as ordinary Git blobs, set a size limit (up to 16 MiB):
+
+```sh
+git config cdc.smallFileMax 1m  # new files up to 1 MiB stay plain Git blobs
+```
+
+Files already committed as manifests keep them, so turning this on doesn't
+make existing files look modified. To convert those too, run
+`git -c cdc.chunk.inherit=false add --renormalize .` and commit. Like the chunk
+settings, use the same value on every clone.
+
 A fresh clone always succeeds even before `git cdc pull` — tracked files hold
 the manifest text until chunks are fetched (same passthrough model as git-lfs
 pointers). git-cdc never emits wrong bytes: every chunk is hash-verified on

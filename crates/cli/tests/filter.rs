@@ -357,6 +357,104 @@ fn inheritance_skips_new_paths_and_oversized_raw_blobs() {
 }
 
 #[test]
+fn small_files_are_stored_as_plain_git_blobs() {
+    for one_shot in [false, true] {
+        let dir = scratch_repo();
+        let repo = dir.path();
+        if one_shot {
+            git(repo, &["config", "--unset", "filter.cdc.process"]);
+        }
+        git(repo, &["config", "cdc.smallFileMax", "1k"]);
+        let files: [(&str, Vec<u8>); 5] = [
+            ("empty.bin", Vec::new()),
+            ("small.bin", vec![b'a'; 512]),
+            ("exact.bin", vec![b'b'; 1024]),
+            ("over.bin", vec![b'c'; 1025]),
+            // Starts like a recipe but isn't one: still ordinary content.
+            (
+                "prefixed.bin",
+                b"version git-cdc/spec/v1\nnot a recipe\n".to_vec(),
+            ),
+        ];
+        for (name, data) in &files {
+            fs::write(repo.join(name), data).unwrap();
+        }
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-qm", "small files"]);
+        for (name, data) in &files {
+            let blob = git(repo, &["cat-file", "blob", &format!("HEAD:{name}")]);
+            if data.len() > 1024 {
+                let manifest = Manifest::parse(blob.as_bytes()).unwrap();
+                assert_eq!(manifest.oid, blake3::hash(data), "{name}");
+            } else {
+                assert_eq!(
+                    blob.as_bytes(),
+                    data.as_slice(),
+                    "{name} one_shot={one_shot}"
+                );
+            }
+            fs::remove_file(repo.join(name)).unwrap();
+        }
+        git(repo, &["checkout", "--", "."]);
+        for (name, data) in &files {
+            assert_eq!(&fs::read(repo.join(name)).unwrap(), data, "{name}");
+        }
+        assert!(git(repo, &["status", "--porcelain"]).is_empty());
+    }
+}
+
+#[test]
+fn small_file_threshold_keeps_committed_recipes_until_renormalized() {
+    let dir = scratch_repo();
+    let repo = dir.path();
+    let small = vec![b's'; 512];
+    fs::write(repo.join("recipe.bin"), &small).unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "before the threshold"]);
+    let recipe = git(repo, &["rev-parse", ":recipe.bin"]);
+    assert!(Manifest::parse(git(repo, &["show", ":recipe.bin"]).as_bytes()).is_ok());
+
+    git(repo, &["config", "cdc.smallFileMax", "1k"]);
+    // Re-cleaning an existing small recipe keeps it: no spurious modification.
+    fs::write(repo.join("recipe.bin"), &small).unwrap();
+    git(repo, &["add", "recipe.bin"]);
+    assert_eq!(git(repo, &["rev-parse", ":recipe.bin"]), recipe);
+    assert!(git(repo, &["status", "--porcelain"]).is_empty());
+
+    // A plain small file that grows past the threshold becomes a recipe.
+    fs::write(repo.join("plain.bin"), [b'p'; 100]).unwrap();
+    git(repo, &["add", "plain.bin"]);
+    git(repo, &["commit", "-qm", "plain"]);
+    assert_eq!(git(repo, &["show", ":plain.bin"]).as_bytes(), [b'p'; 100]);
+    let grown = vec![b'g'; 4096];
+    fs::write(repo.join("plain.bin"), &grown).unwrap();
+    git(repo, &["add", "plain.bin"]);
+    let manifest = Manifest::parse(git(repo, &["show", ":plain.bin"]).as_bytes()).unwrap();
+    assert_eq!(manifest.oid, blake3::hash(&grown));
+
+    // Opting out of inheritance converts existing small recipes deliberately.
+    git(repo, &["config", "cdc.chunk.inherit", "false"]);
+    git(repo, &["add", "--renormalize", "recipe.bin"]);
+    assert_eq!(
+        git(repo, &["show", ":recipe.bin"]).as_bytes(),
+        small.as_slice()
+    );
+}
+
+#[test]
+fn oversized_small_file_threshold_is_rejected() {
+    let dir = scratch_repo();
+    let repo = dir.path();
+    git(repo, &["config", "filter.cdc.required", "true"]);
+    git(repo, &["config", "cdc.smallFileMax", "17m"]);
+    fs::write(repo.join("a.bin"), b"content").unwrap();
+    let out = utils::git_cmd(repo, &["add", "a.bin"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cdc.smallFileMax"), "{stderr}");
+}
+
+#[test]
 fn inheritance_snapshots_the_index_only_for_larger_operations() {
     // A few files are looked up individually; a long-running add switches to
     // one index listing instead of a request per new path.

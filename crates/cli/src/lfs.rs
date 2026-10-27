@@ -13,8 +13,8 @@ use git_cdc_core::chunker::{Chunk, ChunkParams, Chunker};
 use git_cdc_core::manifest::{Manifest, is_manifest};
 use sha2::{Digest, Sha256};
 
-use crate::git::{ChunkParamsFor, chunk_params, git_out, repo_root};
-use crate::manifest::{MAX_MANIFEST_SIZE, detect, read_candidate};
+use crate::git::{ChunkParamsFor, chunk_params, git_out, repo_root, small_file_max};
+use crate::manifest::{MAX_MANIFEST_SIZE, detect, read_candidate, read_small};
 
 pub(crate) mod cache;
 mod context;
@@ -331,7 +331,8 @@ pub(crate) fn clean(
     reader: impl Read,
     mut writer: impl Write,
     store: &Store,
-    params: impl FnOnce() -> ChunkParams,
+    params: &mut ChunkParamsFor,
+    path: Option<&str>,
     chunker: &mut Chunker,
 ) -> Result<()> {
     let mut reader = BufReader::with_capacity(64, reader);
@@ -340,7 +341,13 @@ pub(crate) fn clean(
         writer.write_all(&prefix)?;
         return Ok(());
     }
-    let params = params();
+    // Small files stay ordinary Git blobs, so they never become LFS objects.
+    let (prefix, complete) = read_small(&mut reader, prefix, params.small_file_max())?;
+    if complete && params.stores_plain(path, prefix.len() as u64) {
+        writer.write_all(&prefix)?;
+        return Ok(());
+    }
+    let params = params.get(path);
     let mut refs = BTreeMap::new();
     let mut count = 0usize;
     let (chunks, oid, size) =
@@ -392,12 +399,13 @@ pub(crate) fn smudge(reader: impl Read, mut writer: impl Write, store: &Store) -
 }
 
 pub fn cmd_clean(path: Option<&str>) -> Result<()> {
-    let mut params = ChunkParamsFor::new(chunk_params()?);
+    let mut params = ChunkParamsFor::new(chunk_params()?, small_file_max()?);
     clean(
         io::stdin().lock(),
         io::stdout().lock(),
         &Store::new()?,
-        || params.get(path),
+        &mut params,
+        path,
         &mut Chunker::default(),
     )
 }
@@ -753,7 +761,8 @@ mod tests {
             &b"sample content"[..],
             &mut bytes,
             &store,
-            ChunkParams::default,
+            &mut ChunkParamsFor::new(ChunkParams::default(), 0),
+            None,
             &mut Chunker::default(),
         )
         .unwrap();

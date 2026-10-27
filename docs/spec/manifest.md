@@ -38,6 +38,10 @@ cheap candidate check. Content with that prefix that fails to parse, or
 exceeds the 16 MiB manifest size cap, is ordinary data: clean chunks it,
 smudge passes it through, and history scans skip it.
 
+Clean can also store small ordinary content as a plain blob instead of a
+manifest (`cdc.smallFileMax`). Readers need nothing extra for this: such a
+blob is not a manifest, so smudge passes it through and scans ignore it.
+
 Clean passes a complete, valid manifest for its backend through byte-for-byte,
 so re-adding a file whose content has not been downloaded preserves its recipe.
 Once a blob parses, it remains a recipe: an unknown storage backend, damaged

@@ -4,12 +4,12 @@
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
 use anyhow::{Result, bail};
-use git_cdc_core::chunker::{ChunkParams, Chunker};
+use git_cdc_core::chunker::Chunker;
 use git_cdc_core::manifest::Manifest;
 use git_cdc_core::store::{ChunkStore, DiskStore};
 
-use crate::git::{ChunkParamsFor, chunk_params, local_store};
-use crate::manifest::read_candidate;
+use crate::git::{ChunkParamsFor, chunk_params, local_store, small_file_max};
+use crate::manifest::{read_candidate, read_small};
 
 /// Clean: file content in, manifest out. Shared by the one-shot filter and
 /// the filter-process loop.
@@ -20,7 +20,8 @@ fn clean_stream(
     reader: impl Read,
     mut writer: impl Write,
     store: &DiskStore,
-    params: impl FnOnce() -> ChunkParams,
+    params: &mut ChunkParamsFor,
+    path: Option<&str>,
     chunker: &mut Chunker,
 ) -> Result<()> {
     let mut reader = BufReader::with_capacity(64, reader);
@@ -29,7 +30,13 @@ fn clean_stream(
         writer.write_all(&prefix)?;
         return Ok(());
     }
-    let params = params();
+    // Small files go into Git unchanged (smudge passes non-recipes through).
+    let (prefix, complete) = read_small(&mut reader, prefix, params.small_file_max())?;
+    if complete && params.stores_plain(path, prefix.len() as u64) {
+        writer.write_all(&prefix)?;
+        return Ok(());
+    }
+    let params = params.get(path);
     let input = prefix.as_slice().chain(reader);
     let (chunks, oid, size) = chunker.chunk(input, params, |c, bytes| {
         // The chunker already computed this hash from these bytes.
@@ -80,12 +87,13 @@ fn smudge_stream(reader: impl Read, mut writer: impl Write, store: &DiskStore) -
 pub fn cmd_clean(path: Option<&str>) -> Result<()> {
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();
-    let mut params = ChunkParamsFor::new(chunk_params()?);
+    let mut params = ChunkParamsFor::new(chunk_params()?, small_file_max()?);
     clean_stream(
         stdin,
         stdout,
         &local_store()?,
-        || params.get(path),
+        &mut params,
+        path,
         &mut Chunker::default(),
     )
 }
@@ -141,7 +149,7 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
     };
     // Per-path, so a tracked file keeps the parameters it was committed with
     // even when this clone's `cdc.chunk.*` says otherwise.
-    let mut params = ChunkParamsFor::for_process(chunk_params()?);
+    let mut params = ChunkParamsFor::for_process(chunk_params()?, small_file_max()?);
     let hydrate = crate::git::auto_hydrate()?;
     let mut chunker = Chunker::default();
     let mut result = tempfile::spooled_tempfile(64 * 1024);
@@ -199,7 +207,8 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
                 &mut content,
                 &mut result,
                 store,
-                || params.get(Some(pathname.as_str())),
+                &mut params,
+                Some(pathname.as_str()),
                 &mut chunker,
             ),
             ("smudge", FilterStore::Lfs(store)) => {
@@ -209,7 +218,8 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
                 &mut content,
                 &mut result,
                 store,
-                || params.get(Some(pathname.as_str())),
+                &mut params,
+                Some(pathname.as_str()),
                 &mut chunker,
             ),
             ("smudge", FilterStore::Disk(store)) => smudge_stream(&mut content, &mut result, store),

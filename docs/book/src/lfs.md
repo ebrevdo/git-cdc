@@ -49,6 +49,12 @@ converts the current snapshot, not older commits.
 Ordinary Git LFS files (`filter=lfs`) can live alongside CDC files in the same
 repository.
 
+Git LFS uploads every object with its own request, so patterns that match many
+tiny files make pushes slow. `git config cdc.smallFileMax 1m` keeps new files
+up to 1 MiB as ordinary Git blobs instead; see
+[small files](configuration.md#small-files). This applies to new commits
+only: chunks already referenced by history still have to be uploaded.
+
 ## Choosing the LFS server
 
 Normal Git LFS endpoint discovery applies, including `.lfsconfig`,
