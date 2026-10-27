@@ -5,6 +5,7 @@ use std::fs;
 use std::process::Command;
 
 use git_cdc_core::chunker::test_util::test_data;
+use git_cdc_core::manifest::Manifest;
 
 mod utils;
 
@@ -42,6 +43,101 @@ fn add_checkout_round_trip_is_byte_identical() {
     fs::remove_file(repo.join("asset.bin")).unwrap();
     git(repo, &["checkout", "--", "asset.bin"]);
     assert_eq!(fs::read(repo.join("asset.bin")).unwrap(), data);
+}
+
+#[test]
+fn version_prefixed_content_is_chunked_and_old_raw_blobs_smudge_unchanged() {
+    for one_shot in [false, true] {
+        let dir = scratch_repo();
+        let repo = dir.path();
+        if one_shot {
+            git(repo, &["config", "--unset", "filter.cdc.process"]);
+        }
+        let prefix = b"version git-cdc/spec/v1\nthis is not a manifest, just data\n";
+        for size in [prefix.len(), 16 * 1024 * 1024 + 1] {
+            let mut data = prefix.to_vec();
+            data.resize(size, b'x');
+            fs::write(repo.join("asset.bin"), &data).unwrap();
+            git(repo, &["add", ".gitattributes", "asset.bin"]);
+            git(repo, &["commit", "-qm", "prefixed data"]);
+            let blob = git(repo, &["show", "HEAD:asset.bin"]);
+            let manifest = Manifest::parse(blob.as_bytes()).unwrap();
+            assert_eq!(manifest.oid, blake3::hash(&data));
+            assert_eq!(manifest.size, data.len() as u64);
+            fs::remove_file(repo.join("asset.bin")).unwrap();
+            git(repo, &["checkout", "--", "asset.bin"]);
+            assert_eq!(fs::read(repo.join("asset.bin")).unwrap(), data);
+
+            // Reproduce a raw blob from before the detection fix or tracking.
+            let oid = git(repo, &["hash-object", "-w", "--no-filters", "asset.bin"]);
+            git(
+                repo,
+                &[
+                    "update-index",
+                    "--cacheinfo",
+                    "100644",
+                    oid.trim(),
+                    "asset.bin",
+                ],
+            );
+            git(repo, &["commit", "-qm", "old raw blob"]);
+            fs::remove_file(repo.join("asset.bin")).unwrap();
+            git(repo, &["checkout", "--", "asset.bin"]);
+            assert_eq!(fs::read(repo.join("asset.bin")).unwrap(), data);
+            cdc(repo, &["drop", "--all"]);
+            assert_eq!(fs::read(repo.join("asset.bin")).unwrap(), data);
+            git(repo, &["add", "asset.bin"]);
+            cdc(repo, &["diff"]);
+        }
+    }
+}
+
+#[test]
+fn clean_rejects_a_valid_lfs_manifest() {
+    let dir = scratch_repo();
+    let repo = dir.path();
+    let mut manifest = Manifest::new(
+        blake3::hash(&[]),
+        0,
+        vec![],
+        git_cdc_core::chunker::ChunkParams::default(),
+    );
+    manifest.extra.insert("storage".into(), "git-lfs-v1".into());
+    fs::write(repo.join("foreign.bin"), manifest.encode()).unwrap();
+    git(repo, &["config", "filter.cdc.required", "true"]);
+    for one_shot in [false, true] {
+        if one_shot {
+            git(repo, &["config", "--unset", "filter.cdc.process"]);
+        }
+        let out = utils::git_cmd(repo, &["add", "foreign.bin"]);
+        assert!(!out.status.success());
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("manifest uses filter=cdc-lfs"), "{error}");
+    }
+}
+
+#[test]
+fn default_clean_preserves_damaged_recipes_in_the_index() {
+    for one_shot in [false, true] {
+        let dir = scratch_repo();
+        let repo = dir.path();
+        let required = utils::git_cmd(repo, &["config", "--get", "filter.cdc.required"]);
+        assert_eq!(required.status.code(), Some(1));
+        if one_shot {
+            git(repo, &["config", "--unset", "filter.cdc.process"]);
+        }
+        fs::write(repo.join("asset.bin"), b"original content\n").unwrap();
+        git(repo, &["add", "asset.bin"]);
+        let mut damaged = Manifest::parse(git(repo, &["show", ":asset.bin"]).as_bytes()).unwrap();
+        // The core recipe parses, but its LFS chunk references are missing.
+        damaged.extra.insert("storage".into(), "git-lfs-v1".into());
+        let recipe = damaged.encode();
+        fs::write(repo.join("asset.bin"), &recipe).unwrap();
+
+        // The default optional filter lets Git stage the rejected input unchanged.
+        git(repo, &["add", "asset.bin"]);
+        assert_eq!(git(repo, &["show", ":asset.bin"]), recipe);
+    }
 }
 
 #[test]

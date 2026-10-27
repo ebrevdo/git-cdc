@@ -18,6 +18,9 @@
 # `git cdc install --lfs [--global]` and `git cdc track --lfs '*.bin'`.
 # It installs its required filter and pre-push integration; endpoint and
 # credentials use Git LFS configuration. See docs/book/src/lfs.md.
+# Optional: cap how much missing chunk data a push downloads per batch.
+# [cdc "lfs"]
+# 	transferBatchBytes = 64m
 
 # Mode 1: git-cdc-server (central auth, batch API)
 # [cdc]

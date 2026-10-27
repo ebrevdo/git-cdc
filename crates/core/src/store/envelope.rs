@@ -34,23 +34,26 @@ pub fn encode(raw: &[u8]) -> Vec<u8> {
 /// Decode + verify: returns the raw chunk bytes or fails loudly. Never
 /// returns unverified data.
 pub fn decode(bytes: &[u8], expected: &blake3::Hash) -> Result<Vec<u8>> {
-    // Legacy (pre-envelope) object: the buffer is the chunk.
-    if blake3::hash(bytes) == *expected {
-        return Ok(bytes.to_vec());
-    }
-    let raw = match bytes.split_first() {
-        Some((&TAG_RAW, rest)) => rest.to_vec(),
+    let decoded = match bytes.split_first() {
+        Some((&TAG_RAW, rest)) => Ok(rest.to_vec()),
         Some((&TAG_ZSTD, rest)) => {
             // Capacity bound: chunks never exceed the protocol ceiling.
             zstd::bulk::decompress(rest, crate::chunker::CEILING as usize + 1)
-                .context("zstd decompress")?
+                .context("zstd decompress")
         }
-        _ => bail!("chunk {} is corrupt (bad envelope)", expected.to_hex()),
+        _ => Err(anyhow::anyhow!(
+            "chunk {} is corrupt (bad envelope)",
+            expected.to_hex()
+        )),
     };
-    if blake3::hash(&raw) != *expected {
-        bail!("chunk {} is corrupt (hash mismatch)", expected.to_hex());
+    // Bare legacy chunks can start with either envelope tag, even a valid
+    // zstd frame. Fall back only after the usual format fails verification.
+    match decoded {
+        Ok(raw) if blake3::hash(&raw) == *expected => Ok(raw),
+        _ if blake3::hash(bytes) == *expected => Ok(bytes.to_vec()),
+        Ok(_) => bail!("chunk {} is corrupt (hash mismatch)", expected.to_hex()),
+        Err(error) => Err(error),
     }
-    Ok(raw)
 }
 
 #[cfg(test)]
@@ -85,9 +88,13 @@ mod tests {
     fn legacy_bare_bytes_still_decode() {
         let raw = b"a chunk stored before the envelope existed".to_vec();
         assert_eq!(decode(&raw, &blake3::hash(&raw)).unwrap(), raw);
-        // Even legacy bytes that LOOK like an envelope: hash wins first.
-        let tricky = [&[TAG_ZSTD][..], b"not actually zstd"].concat();
-        assert_eq!(decode(&tricky, &blake3::hash(&tricky)).unwrap(), tricky);
+        for tricky in [
+            [&[TAG_ZSTD][..], b"not actually zstd"].concat(),
+            [&[TAG_RAW][..], b"raw legacy chunk"].concat(),
+            encode(&vec![7; 4096]),
+        ] {
+            assert_eq!(decode(&tricky, &blake3::hash(&tricky)).unwrap(), tricky);
+        }
     }
 
     #[test]

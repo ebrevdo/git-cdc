@@ -16,23 +16,9 @@ use git_cdc_core::manifest::Manifest;
 const BIN: &str = env!("CARGO_BIN_EXE_git-cdc");
 const RETENTION_PREFIX: &str = "refs/notes/git-cdc-lfs";
 
-fn traced_git_commands(path: &Path) -> Vec<Vec<String>> {
-    fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .filter_map(|line| {
-            let event: serde_json::Value = serde_json::from_str(line).unwrap();
-            (event["event"] == "start").then(|| {
-                event["argv"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|arg| arg.as_str().unwrap().to_owned())
-                    .collect()
-            })
-        })
-        .collect()
-}
+mod utils;
+
+use utils::traced_git_commands;
 
 #[path = "lfs_support/proxy.rs"]
 mod proxy;
@@ -260,6 +246,22 @@ impl Fixture {
         fs::write(self.repo.join(path), data).unwrap();
     }
 
+    fn stage_raw_file(&self, path: &str, source: &Path) {
+        let oid = self.git(
+            &self.repo,
+            &[
+                "hash-object",
+                "-w",
+                "--no-filters",
+                source.to_str().unwrap(),
+            ],
+        );
+        self.git(
+            &self.repo,
+            &["update-index", "--cacheinfo", "100644", oid.trim(), path],
+        );
+    }
+
     fn publish_file(&self, path: &str, data: &[u8], message: &str) {
         self.write(path, data);
         self.git(&self.repo, &["add", path]);
@@ -343,6 +345,17 @@ for line in sys.stdin:
             .trim()
             .to_owned()
     }
+
+    /// Model a commit written by another client without invoking filters or hooks.
+    fn commit_without_filters(&self, message: &str) {
+        let tree = self.git(&self.repo, &["write-tree"]);
+        let commit = self.git(
+            &self.repo,
+            &["commit-tree", tree.trim(), "-p", "HEAD", "-m", message],
+        );
+        self.git(&self.repo, &["update-ref", "HEAD", commit.trim()]);
+    }
+
     fn push(&self) {
         self.git(&self.repo, &["push", "-u", "origin", "main"]);
     }
@@ -683,6 +696,137 @@ fn missing_and_corrupt_data_block_checkout_and_push_without_emitting_bytes() {
 }
 
 #[test]
+fn version_prefixed_content_is_chunked_and_old_raw_blobs_smudge_unchanged() {
+    for one_shot in [false, true] {
+        let f = Fixture::new();
+        if one_shot {
+            f.git(
+                &f.repo,
+                &["config", "--global", "--unset", "filter.cdc-lfs.process"],
+            );
+        }
+        for (name, size) in [("notes.txt", 64), ("large.txt", 16 * 1024 * 1024 + 1)] {
+            let mut data = b"version git-cdc/spec/v1\nthis is not a manifest\n".to_vec();
+            data.resize(size, b'x');
+            f.write(name, &data);
+            f.git(&f.repo, &["add", name]);
+        }
+        for size in [64, 16 * 1024 * 1024 + 1] {
+            let mut data = b"version git-cdc/spec/v1\nthis is not a manifest, just data\n".to_vec();
+            data.resize(size, b'x');
+            f.write("asset.bin", &data);
+            f.git(&f.repo, &["add", "asset.bin"]);
+            f.commit("prefixed data");
+            let manifest = f.manifest("HEAD:asset.bin");
+            assert_eq!(manifest.oid, blake3::hash(&data));
+            assert_eq!(manifest.size, data.len() as u64);
+            fs::remove_file(f.repo.join("asset.bin")).unwrap();
+            f.git(&f.repo, &["checkout", "--", "asset.bin"]);
+            assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
+
+            f.stage_raw_file("asset.bin", &f.repo.join("asset.bin"));
+            f.commit("old raw blob");
+            fs::remove_file(f.repo.join("asset.bin")).unwrap();
+            f.git(&f.repo, &["checkout", "--", "asset.bin"]);
+            assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
+            f.cdc(&f.repo, &["drop", "--all"]);
+            assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
+            f.git(&f.repo, &["add", "asset.bin"]);
+        }
+        f.commit("rechunked content");
+        f.push();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn history_skips_oversized_blobs_before_requesting_content() {
+    let f = Fixture::new();
+    let mut data = b"version git-cdc/spec/v1\nordinary content\n".to_vec();
+    data.resize(16 * 1024 * 1024 + 1, b'x');
+    f.write("large.txt", &data);
+    f.write("asset.bin", b"real CDC file\n");
+    f.git(&f.repo, &["add", "large.txt", "asset.bin"]);
+    f.commit("bounded history scan");
+    let large = f
+        .git(&f.repo, &["rev-parse", "HEAD:large.txt"])
+        .trim()
+        .to_owned();
+    let recipe = f
+        .git(&f.repo, &["rev-parse", "HEAD:asset.bin"])
+        .trim()
+        .to_owned();
+    let head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    let mut updates = tempfile::tempfile().unwrap();
+    writeln!(
+        updates,
+        "refs/heads/main {} refs/heads/main {}",
+        head.trim(),
+        "0".repeat(40)
+    )
+    .unwrap();
+    updates.rewind().unwrap();
+    let mut command = f.command(&f.repo, BIN);
+    command
+        .args(["lfs-pre-push", "origin", f.remote.to_str().unwrap()])
+        .stdin(Stdio::from(updates));
+    let (output, requests) = utils::record_blob_requests(&mut command, f.temp.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(requests.contains(&recipe));
+    assert!(!requests.contains(&large));
+}
+
+#[test]
+fn clean_rejects_a_valid_legacy_manifest() {
+    let f = Fixture::new();
+    let manifest = Manifest::new(
+        blake3::hash(&[]),
+        0,
+        vec![],
+        git_cdc_core::chunker::ChunkParams::default(),
+    );
+    f.write("foreign.bin", manifest.encode().as_bytes());
+    for one_shot in [false, true] {
+        if one_shot {
+            f.git(
+                &f.repo,
+                &["config", "--global", "--unset", "filter.cdc-lfs.process"],
+            );
+        }
+        let out = f.run(&f.repo, &["add", "foreign.bin"]);
+        assert!(!out.status.success());
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("manifest uses filter=cdc;"), "{error}");
+    }
+}
+
+#[test]
+fn parsed_history_recipes_with_broken_lfs_references_block_push() {
+    let f = Fixture::new();
+    f.publish_file("asset.bin", b"valid content\n", "valid recipe");
+    let published = f.git(&f.remote, &["rev-parse", "refs/heads/main"]);
+    let mut damaged = f.manifest("HEAD:asset.bin");
+    damaged
+        .extra
+        .remove(&format!("lfs.{}", damaged.chunks[0].hash.to_hex()));
+    f.write("damaged.txt", damaged.encode().as_bytes());
+    f.git(&f.repo, &["add", "damaged.txt"]);
+    f.commit("damaged recipe inserted as plain Git content");
+    let out = f.run(&f.repo, &["push", "origin", "main"]);
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("missing LFS chunk reference"), "{error}");
+    assert_eq!(
+        f.git(&f.remote, &["rev-parse", "refs/heads/main"]),
+        published
+    );
+}
+
+#[test]
 fn raw_passthrough_empty_files_quoted_paths_and_concurrent_cleans() {
     let f = Fixture::new();
     // Exercise the one-shot fallback as well as path quoting/option boundaries.
@@ -761,42 +905,44 @@ fn raw_passthrough_empty_files_quoted_paths_and_concurrent_cleans() {
 #[test]
 fn large_file_filter_process_under_address_space_limit() {
     use git_cdc_core::pktline::{PktReader, PktWriter, read_text, write_flush, write_text};
-    let f = Fixture::new();
+    const FILE_MIB: usize = 128;
+    const ADDRESS_SPACE_MIB: usize = 96;
+    let f = Fixture::file();
+    for key in ["cdc.chunk.min", "cdc.chunk.avg", "cdc.chunk.max"] {
+        f.git(&f.repo, &["config", key, "1m"]);
+    }
     let block = test_data(1024 * 1024, 6);
-    let mut file = File::create(f.repo.join("large.bin")).unwrap();
-    for _ in 0..256 {
-        file.write_all(&block).unwrap();
-    }
-    drop(file);
-    let constrained = |args: &[&str]| {
-        let out = f.command(&f.repo, "python3").args(["-c",
-            "import os,resource,sys; resource.setrlimit(resource.RLIMIT_AS,(192*1024*1024,192*1024*1024)); os.execvp('git',['git']+sys.argv[1:])"])
-            .args(args).output().unwrap();
-        assert!(
-            out.status.success(),
-            "bounded-memory git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    constrained(&["add", "large.bin"]);
-    f.commit("256 MiB with memory cap");
-    f.push();
-    fs::remove_file(f.repo.join("large.bin")).unwrap();
-    // Git itself buffers smudge output. Check its byte-correct checkout
-    // without constraining Git, then constrain the filter protocol process.
-    f.git(&f.repo, &["restore", "large.bin"]);
-    let mut restored = File::open(f.repo.join("large.bin")).unwrap();
-    let mut expected = blake3::Hasher::new();
-    for _ in 0..256 {
-        expected.update(&block);
-    }
-    let mut actual = blake3::Hasher::new();
-    actual.update_reader(&mut restored).unwrap();
-    assert_eq!(actual.finalize(), expected.finalize());
-    let mut child = f.command(&f.repo, "python3").args(["-c",
-        "import resource,subprocess,sys; resource.setrlimit(resource.RLIMIT_AS,(192*1024*1024,192*1024*1024)); p=subprocess.run(sys.argv[1:]); print('FILTER_MAX_RSS_KIB',resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,file=sys.stderr); sys.exit(p.returncode)",
-        BIN, "lfs-filter-process"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let prefix = b"version git-cdc/spec/v1\nordinary large file\n";
+    let file_bytes = (FILE_MIB * block.len() + prefix.len()) as u64;
+    // Leave room for the debug executable and the 16 MiB manifest probe,
+    // while keeping the input larger than the entire address-space limit.
+    let address_space_bytes = (ADDRESS_SPACE_MIB * 1024 * 1024).to_string();
+    let memory_limit_wrapper = r#"
+import resource
+import subprocess
+import sys
+
+limit = int(sys.argv[1])
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+result = subprocess.run(sys.argv[2:])
+rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+print("FILTER_MAX_RSS_KIB", rss, file=sys.stderr)
+sys.exit(result.returncode)
+"#;
+    let mut child = f
+        .command(&f.repo, "python3")
+        .args([
+            "-c",
+            memory_limit_wrapper,
+            &address_space_bytes,
+            BIN,
+            "lfs-filter-process",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
     write_text(&mut input, "git-filter-client").unwrap();
@@ -811,13 +957,42 @@ fn large_file_filter_process_under_address_space_limit() {
         Some("version=2")
     );
     assert!(read_text(&mut output).unwrap().is_none());
+    write_text(&mut input, "capability=clean").unwrap();
     write_text(&mut input, "capability=smudge").unwrap();
     write_flush(&mut input).unwrap();
     while read_text(&mut output).unwrap().is_some() {}
+
+    // Exercise both filters directly: no Git checkout or remote transfer is
+    // needed to prove the process cannot buffer an entire input or output.
+    write_text(&mut input, "command=clean").unwrap();
+    write_text(&mut input, "pathname=large.bin").unwrap();
+    write_flush(&mut input).unwrap();
+    let mut expected = blake3::Hasher::new();
+    expected.update(prefix);
+    {
+        let mut packets = PktWriter::new(&mut input);
+        packets.write_all(prefix).unwrap();
+        for _ in 0..FILE_MIB {
+            packets.write_all(&block).unwrap();
+            expected.update(&block);
+        }
+    }
+    write_flush(&mut input).unwrap();
+    let expected_hash = expected.finalize();
+    assert_eq!(
+        read_text(&mut output).unwrap().as_deref(),
+        Some("status=success")
+    );
+    assert!(read_text(&mut output).unwrap().is_none());
+    let recipe = std::io::read_to_string(PktReader::new(&mut output)).unwrap();
+    assert!(read_text(&mut output).unwrap().is_none());
+    let manifest = Manifest::parse(recipe.as_bytes()).unwrap();
+    assert_eq!(manifest.oid, expected_hash);
+    assert_eq!(manifest.size, file_bytes);
+
     write_text(&mut input, "command=smudge").unwrap();
     write_text(&mut input, "pathname=large.bin").unwrap();
     write_flush(&mut input).unwrap();
-    let recipe = f.git(&f.repo, &["show", "HEAD:large.bin"]);
     PktWriter::new(&mut input)
         .write_all(recipe.as_bytes())
         .unwrap();
@@ -829,7 +1004,7 @@ fn large_file_filter_process_under_address_space_limit() {
     assert!(read_text(&mut output).unwrap().is_none());
     let mut streamed = blake3::Hasher::new();
     streamed.update_reader(PktReader::new(&mut output)).unwrap();
-    assert_eq!(streamed.finalize(), expected.finalize());
+    assert_eq!(streamed.finalize(), expected_hash);
     assert!(read_text(&mut output).unwrap().is_none());
     drop(input);
     let result = child.wait_with_output().unwrap();
@@ -839,11 +1014,7 @@ fn large_file_filter_process_under_address_space_limit() {
         String::from_utf8_lossy(&result.stderr)
     );
     println!("{}", String::from_utf8_lossy(&result.stderr));
-    println!(
-        "PERF large_file_bytes={} address_space_limit_bytes={}",
-        256 * 1024 * 1024,
-        192 * 1024 * 1024
-    );
+    println!("PERF large_file_bytes={file_bytes} address_space_limit_bytes={address_space_bytes}");
 }
 
 #[test]
@@ -1288,6 +1459,90 @@ fn standard_lfs_files_coexist_and_local_hooks_still_receive_updates() {
         fs::read(clone.join("stock.raw")).unwrap(),
         b"ordinary LFS content\n"
     );
+}
+
+#[test]
+fn damaged_and_unknown_storage_recipes_block_clean_and_checkout_without_emitting_bytes() {
+    for driver in ["cdc", "cdc-lfs"] {
+        for one_shot in [false, true] {
+            let f = Fixture::new();
+            let content = b"checked content\n";
+            f.write("a.bin", content);
+            f.git(&f.repo, &["add", "a.bin"]);
+            f.commit("valid recipe");
+            let original = f.manifest("HEAD:a.bin");
+            let commands = if driver == "cdc" {
+                f.write(".gitattributes", b"*.bin filter=cdc -text\n");
+                f.git(&f.repo, &["add", ".gitattributes"]);
+                for (key, command) in [
+                    ("clean", "git-cdc clean %f"),
+                    ("smudge", "git-cdc smudge"),
+                    ("process", "git-cdc filter-process"),
+                    ("required", "true"),
+                ] {
+                    f.git(&f.repo, &["config", &format!("filter.cdc.{key}"), command]);
+                }
+                ["clean", "smudge"]
+            } else {
+                ["lfs-clean", "lfs-smudge"]
+            };
+            if one_shot {
+                f.git(
+                    &f.repo,
+                    &["config", &format!("filter.{driver}.process"), ""],
+                );
+            }
+            let mut damaged = original.clone();
+            damaged
+                .extra
+                .remove(&format!("lfs.{}", damaged.chunks[0].hash.to_hex()));
+            let mut future = original;
+            future.extra.insert("storage".into(), "git-lfs-v2".into());
+            let source = f.temp.path().join("recipe");
+            for (recipe, error) in [
+                (damaged, "missing LFS chunk reference"),
+                (future, "unsupported CDC storage backend \"git-lfs-v2\""),
+            ] {
+                let encoded = recipe.encode();
+                assert_eq!(Manifest::parse(encoded.as_bytes()).unwrap(), recipe);
+                fs::write(&source, &encoded).unwrap();
+                f.stage_raw_file("a.bin", &source);
+                f.write("a.bin", content);
+                f.commit_without_filters("parsed recipe requiring rejection");
+
+                for command in commands {
+                    let out = f
+                        .command(&f.repo, BIN)
+                        .arg(command)
+                        .stdin(File::open(&source).unwrap())
+                        .output()
+                        .unwrap();
+                    assert!(
+                        !out.status.success(),
+                        "{driver} {command} accepted a recipe: {error}"
+                    );
+                    assert!(
+                        out.stdout.is_empty(),
+                        "{driver} {command} emitted recipe bytes"
+                    );
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(stderr.contains(error), "{stderr}");
+                }
+
+                fs::remove_file(f.repo.join("a.bin")).unwrap();
+                let out = f.run(&f.repo, &["checkout", "--", "a.bin"]);
+                assert!(
+                    !out.status.success(),
+                    "{driver} checkout accepted a recipe: {error}"
+                );
+                match fs::read(f.repo.join("a.bin")) {
+                    Ok(bytes) => assert!(bytes.is_empty(), "failed checkout wrote content"),
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+                }
+                assert_eq!(f.git(&f.repo, &["show", ":a.bin"]), encoded);
+            }
+        }
+    }
 }
 
 #[test]
@@ -2237,6 +2492,34 @@ fn warm_push_combines_multiple_object_batches() {
 }
 
 #[test]
+fn unchanged_history_cache_is_not_rewritten_for_a_new_destination() {
+    let f = Fixture::new();
+    f.publish_file(
+        "a.bin",
+        b"same history, new destination\n",
+        "cache metadata",
+    );
+    let cache = f.repo.join(".git/cdc/lfs/history-v1.json");
+    let marker = utils::cache_write_marker(&cache);
+    let destination = f.temp.path().join("other-destination.git");
+    f.git(
+        f.temp.path(),
+        &["init", "--bare", "-q", destination.to_str().unwrap()],
+    );
+    f.git(
+        &f.repo,
+        &["remote", "add", "other", destination.to_str().unwrap()],
+    );
+    f.git(&f.repo, &["push", "other", "main"]);
+    assert_eq!(fs::metadata(cache).unwrap().modified().unwrap(), marker);
+    assert_eq!(
+        f.git(&destination, &["rev-parse", "refs/heads/main"]),
+        f.git(&f.repo, &["rev-parse", "HEAD"])
+    );
+    assert!(!f.refs(&destination, RETENTION_PREFIX).is_empty());
+}
+
+#[test]
 fn history_cache_never_substitutes_for_remote_availability() {
     let f = Fixture::new();
     f.publish_file("a.bin", b"must still exist remotely\n", "cached ancestry");
@@ -2464,12 +2747,36 @@ fn rejected_cold_transfer_keeps_fetched_objects_until_retention_succeeds() {
 }
 
 #[test]
+fn push_rejects_invalid_transfer_budgets_before_publication() {
+    let key = "cdc.lfs.transferBatchBytes";
+    let f = Fixture::file();
+    f.write("a.bin", b"invalid budget must block publication\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("validate transfer budget");
+    for value in ["0", "-1", "invalid"] {
+        f.git(&f.repo, &["config", key, value]);
+        let out = f.run(&f.repo, &["push", "origin", "main"]);
+        assert!(!out.status.success(), "accepted budget {value}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(key));
+        assert!(f.refs(&f.remote, "refs").is_empty());
+        assert!(f.objects().is_empty());
+    }
+    f.git(&f.repo, &["config", "--unset", key]);
+    f.push();
+}
+
+#[test]
 fn cold_mirror_uses_bounded_batches_and_evicts_only_fetched_chunks() {
+    const BATCH_BYTES: u64 = 1024 * 1024;
     let f = Fixture::new();
     if f.endpoint.is_some() {
         return; // Separate file remotes provide independent source/destination stores.
     }
-    let data = test_data(80 * 1024 * 1024, 457);
+    f.git(&f.repo, &["config", "cdc.lfs.transferBatchBytes", "1m"]);
+    f.git(&f.repo, &["config", "cdc.chunk.min", "16k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.avg", "32k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.max", "64k"]);
+    let data = test_data(1280 * 1024, 457);
     f.publish_file("a.bin", &data, "more content than the transfer budget");
     let backup = f.temp.path().join("bounded-backup.git");
     f.git(f.temp.path(), &["init", "--bare", backup.to_str().unwrap()]);
@@ -2504,7 +2811,7 @@ fn cold_mirror_uses_bounded_batches_and_evicts_only_fetched_chunks() {
         .map(|line| line.parse().unwrap())
         .collect();
     assert!(sizes.len() > 1, "the transfer must span several batches");
-    assert!(sizes.iter().all(|size| *size <= 64 * 1024 * 1024));
+    assert!(sizes.iter().all(|size| *size <= BATCH_BYTES));
     assert_eq!(objects_at(&cache).len(), 1);
     assert!(path.is_file(), "pre-existing objects must remain cached");
     let recovered = f.temp.path().join("bounded-recovery");
@@ -2585,6 +2892,73 @@ fn retention_identical_content_from_independent_clones_keeps_fresh_pins() {
 // Lifecycle checks use the unmodified reference HTTP server so verification
 // exercises the stock client's real remote checks.
 #[test]
+fn lifecycle_pull_batches_downloads_and_skips_existing_content() {
+    let f = Fixture::new();
+    for key in ["cdc.chunk.min", "cdc.chunk.avg", "cdc.chunk.max"] {
+        f.git(&f.repo, &["config", key, "64k"]);
+    }
+    let data = test_data(129 * 64 * 1024, 921);
+    f.publish_file("asset.bin", &data, "batched download fixture");
+    f.cdc(&f.repo, &["drop", "--all"]);
+    fs::remove_dir_all(f.repo.join(".git/cdc/lfs/objects")).unwrap();
+    let trace = f.temp.path().join("pull.jsonl");
+    let out = f
+        .command(&f.repo, BIN)
+        .arg("pull")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let commands = traced_git_commands(&trace);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|args| args.windows(2).any(|args| args == ["lfs", "fetch"]))
+            .count(),
+        2
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|args| args.windows(2).any(|args| args == ["lfs", "smudge"]))
+    );
+    assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
+
+    let recipe = f.git(&f.repo, &["show", ":asset.bin"]);
+    let manifest = f.manifest(":asset.bin");
+    let oid = &manifest.extra[&format!("lfs.{}", manifest.chunks[0].hash.to_hex())];
+    let chunk = f
+        .repo
+        .join(".git/cdc/lfs/objects")
+        .join(&oid[..2])
+        .join(&oid[2..4])
+        .join(oid);
+    fs::write(&chunk, "corrupt cached chunk").unwrap();
+    let mut edited = data.clone();
+    edited[0] ^= 0xff;
+    f.write("asset.bin", &edited);
+    f.cdc(&f.repo, &["pull"]);
+    assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), edited);
+    assert_eq!(f.git(&f.repo, &["show", ":asset.bin"]), recipe);
+
+    // A recipe that actually needs hydration must still reject that cache entry.
+    f.write("asset.bin", recipe.as_bytes());
+    let out = f.command(&f.repo, BIN).arg("pull").output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("corrupt LFS chunk"));
+    assert_eq!(
+        fs::read(f.repo.join("asset.bin")).unwrap(),
+        recipe.as_bytes()
+    );
+    assert_eq!(f.git(&f.repo, &["show", ":asset.bin"]), recipe);
+    assert!(!f.repo.join(".git/index.lock").exists());
+}
+
+#[test]
 fn lifecycle_lfs_drop_and_pull_reclaim_disk_and_preserve_the_index() {
     let f = Fixture::http();
     let data = test_data(3 * 1024 * 1024, 701);
@@ -2602,6 +2976,9 @@ fn lifecycle_lfs_drop_and_pull_reclaim_disk_and_preserve_the_index() {
     assert_eq!(f.git(&f.repo, &["ls-files", "--stage"]), index);
     assert!(f.git(&f.repo, &["status", "--porcelain"]).is_empty());
     assert_eq!(f.objects(), remote, "drop only evicts local objects");
+
+    f.git(&f.repo, &["add", "asset.bin"]);
+    assert_eq!(f.git(&f.repo, &["show", ":asset.bin"]), recipe);
 
     f.cdc(&f.repo, &["pull", "--", "asset.bin"]);
     assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
@@ -2797,23 +3174,111 @@ fn lifecycle_http_eviction_needs_both_remote_content_and_retention() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn lifecycle_http_eviction_reads_only_candidate_pointers_and_reuses_git_objects() {
+    let f = Fixture::http();
+    f.publish_file(
+        "other.bin",
+        &test_data(2 * 1024 * 1024, 743),
+        "unrelated chunks",
+    );
+    let unrelated = f.manifest("HEAD:other.bin");
+    f.git(&f.repo, &["rm", "other.bin"]);
+    f.commit("retain deleted history");
+    f.publish_file("asset.bin", b"one eviction candidate\n", "candidate");
+    let candidate = f.manifest("HEAD:asset.bin");
+    let objects = f.git(&f.repo, &["rev-list", "--objects", "--all"]);
+    let blobs: BTreeMap<_, _> = objects
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(oid, path)| (path, oid.to_owned()))
+        .collect();
+    let pointer_blob = |manifest: &Manifest, chunk: &git_cdc_core::chunker::Chunk| {
+        let oid = &manifest.extra[&format!("lfs.{}", chunk.hash.to_hex())];
+        blobs[format!("chunks/{}/{}.lfs", &oid[..2], &oid[2..]).as_str()].clone()
+    };
+    let expected = pointer_blob(&candidate, &candidate.chunks[0]);
+    let unrelated_blobs: Vec<_> = unrelated
+        .chunks
+        .iter()
+        .map(|chunk| pointer_blob(&unrelated, chunk))
+        .collect();
+    let trace = f.temp.path().join("eviction-trace.jsonl");
+    let mut command = f.command(&f.repo, BIN);
+    command
+        .env("GIT_TRACE2_EVENT", &trace)
+        .args(["drop", "--chunks", "asset.bin"]);
+    let (output, requests) = utils::record_blob_requests(&mut command, f.temp.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        requests.contains(&expected),
+        "candidate pointer size must be checked"
+    );
+    assert!(
+        unrelated_blobs.iter().all(|oid| !requests.contains(oid)),
+        "unrelated retained pointer blobs must not be read"
+    );
+    let commands = traced_git_commands(&trace);
+    assert!(
+        !commands
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "pack-objects")),
+        "a warm verification must not transfer Git objects"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|args| args.iter().any(|arg| arg == "fetch")
+                && args.iter().any(|arg| arg == "--stdin"))
+            .count(),
+        1
+    );
+    let candidate_oid = &candidate.extra[&format!("lfs.{}", candidate.chunks[0].hash.to_hex())];
+    assert!(
+        objects_at(&f.repo.join(".git/cdc/lfs/objects"))
+            .keys()
+            .all(|path| object_name(path) != *candidate_oid)
+    );
+}
+
 #[test]
 fn lifecycle_http_verification_batches_keep_the_missing_objects_cached() {
     let f = Fixture::http();
     for key in ["cdc.chunk.min", "cdc.chunk.avg", "cdc.chunk.max"] {
-        f.git(&f.repo, &["config", key, "64k"]);
+        f.git(&f.repo, &["config", key, "1k"]);
     }
     f.publish_file(
         "asset.bin",
-        &test_data(130 * 64 * 1024, 727),
+        &test_data(1026 * 1024, 727),
         "more than one verification batch",
     );
     let remote = f.objects();
-    assert!(remote.len() > 128);
+    assert_eq!(remote.len(), 1026);
     let missing_path = remote.keys().next().unwrap();
     let missing = object_name(missing_path);
     fs::remove_file(missing_path).unwrap();
-    f.cdc(&f.repo, &["drop", "--chunks", "asset.bin"]);
+    let trace = f.temp.path().join("verification-trace.jsonl");
+    let output = f
+        .command(&f.repo, BIN)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .args(["drop", "--chunks", "asset.bin"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verifications = traced_git_commands(&trace)
+        .into_iter()
+        .filter(|args| args.windows(2).any(|args| args == ["lfs", "prune"]))
+        .count();
+    assert_eq!(verifications, 2, "verification amortizes client startup");
     let remaining = objects_at(&f.repo.join(".git/cdc/lfs/objects"));
     assert!(remaining.keys().any(|path| object_name(path) == missing));
     assert!(

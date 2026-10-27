@@ -3,7 +3,7 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -83,18 +83,38 @@ impl Cache {
     }
 
     pub fn fetch(&self, objects: &[(String, u64)]) -> Result<()> {
+        const BATCH_OBJECTS: usize = 128;
+        const BATCH_BYTES: u64 = 64 * 1024 * 1024;
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0;
         for (oid, size) in objects {
             if self.cached_bytes(oid)?.is_some() {
-                self.read(oid, *size)?;
                 continue;
             }
-            let bytes = self.context()?.download(oid, *size)?;
-            ensure!(
-                self.store.put(&bytes)? == *oid,
-                "LFS download object ID mismatch"
-            );
+            if !pending.is_empty()
+                && (pending.len() == BATCH_OBJECTS || pending_bytes + size > BATCH_BYTES)
+            {
+                self.fetch_batch(&pending)?;
+                pending.clear();
+                pending_bytes = 0;
+            }
+            pending.push((oid.clone(), *size));
+            pending_bytes += size;
+        }
+        if !pending.is_empty() {
+            self.fetch_batch(&pending)?;
         }
         Ok(())
+    }
+
+    fn fetch_batch(&self, objects: &[(String, u64)]) -> Result<()> {
+        self.context()?.download_batch(objects, |oid, bytes| {
+            ensure!(
+                self.store.put(&bytes)? == oid,
+                "LFS download object ID mismatch"
+            );
+            Ok(())
+        })
     }
 
     pub fn inventory(&self) -> Result<Vec<(String, u64)>> {
@@ -137,6 +157,9 @@ impl Cache {
 
     pub fn remote_presence(&self, objects: &[(String, u64)]) -> Result<HashSet<String>> {
         self.verified.borrow_mut().clear();
+        if objects.is_empty() {
+            return Ok(HashSet::new());
+        }
         let context = self.context()?;
         let roots = fetch_retention_roots(context)?;
         if roots.is_empty() {
@@ -147,8 +170,9 @@ impl Cache {
             .map(|(oid, size)| (oid.as_str(), *size))
             .collect();
         let mut rooted = BTreeSet::new();
-        retention::visit_objects_with(
+        retention::visit_candidates_with(
             &roots,
+            &wanted,
             |oid, size| {
                 if wanted.get(oid) == Some(&size) {
                     rooted.insert(oid.to_owned());
@@ -229,6 +253,7 @@ fn check_directory(path: &Path, message: &str) -> Result<()> {
 
 fn fetch_retention_roots(context: &DownloadContext) -> Result<BTreeSet<String>> {
     let destination = context.destination()?;
+    context.share_source_objects()?;
     let output = context
         .command()
         .args([
@@ -246,23 +271,30 @@ fn fetch_retention_roots(context: &DownloadContext) -> Result<BTreeSet<String>> 
         retention::parse_remote_roots(std::str::from_utf8(&output.stdout)?)?
             .into_iter()
             .unzip();
-    for references in references.chunks(128) {
-        let status = context
-            .command()
-            .args([
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--no-write-fetch-head",
-                destination,
-            ])
-            .args(references)
-            .stdout(Stdio::null())
-            .status()?;
-        ensure!(
-            status.success(),
-            "cannot fetch remote LFS retention metadata"
-        );
+    if references.is_empty() {
+        return Ok(roots);
     }
+    let mut input = tempfile::tempfile()?;
+    for reference in references {
+        writeln!(input, "{reference}")?;
+    }
+    input.rewind()?;
+    let status = context
+        .command()
+        .args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--stdin",
+            destination,
+        ])
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::null())
+        .status()?;
+    ensure!(
+        status.success(),
+        "cannot fetch remote LFS retention metadata"
+    );
     Ok(roots)
 }

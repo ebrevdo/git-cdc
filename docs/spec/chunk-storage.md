@@ -27,11 +27,12 @@ protocol ceiling).
 ## Legacy objects
 
 Stores written before this format hold bare chunk bytes with no tag.
-Readers MUST detect them hash-first: if the entire object hashes to the
-expected chunk id, it is a legacy raw chunk; only otherwise is the first
-byte interpreted as an envelope tag. Both interpretations end in hash
-verification, so misdetection is impossible — an object that satisfies
-neither is corrupt and MUST be rejected.
+Readers MUST accept an object whose entire contents hash to the expected
+chunk id as a legacy raw chunk, even when it starts with an envelope tag.
+Readers MAY first decode and verify the envelope, falling back to the legacy
+interpretation when decoding or verification fails. Both interpretations end
+in hash verification — an object that satisfies neither is corrupt and MUST
+be rejected.
 
 Writers MAY emit legacy raw bodies (an old client uploading to a new
 server is accepted through the same rule); new writers SHOULD always emit

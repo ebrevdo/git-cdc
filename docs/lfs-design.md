@@ -95,8 +95,9 @@ pre-push execution while preserving server-side hooks and ref policies.
 
 Transfers negotiate at most 128 objects per batch. A private pointer-only
 worktree lets the stock client negotiate using IDs and sizes even with no
-cached content. The recovery budget is 64 MiB of missing local content, with
-oversized chunks handled individually. HTTP batches exceeding that budget try
+cached content. The recovery budget is 64 MiB of missing local content by
+default (`cdc.lfs.transferBatchBytes`), with oversized chunks handled
+individually. HTTP batches exceeding that budget try
 metadata negotiation first; if all objects already exist remotely, no recovery
 or smaller batch is needed. Failed cold batches are split until missing objects
 can be recovered and retried within the budget; errors are never

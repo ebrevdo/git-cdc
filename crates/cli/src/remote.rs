@@ -118,9 +118,9 @@ impl SshRemote {
         }
     }
 
-    fn expect_ok(&mut self) -> Result<()> {
+    fn expect_ok(from: &mut impl std::io::BufRead) -> Result<()> {
         use git_cdc_core::pktline::read_text;
-        match read_text(&mut self.from)?.as_deref() {
+        match read_text(from)?.as_deref() {
             Some("ok") => Ok(()),
             Some(err) => bail!("ssh remote: {err}"),
             None => bail!("ssh remote closed the stream"),
@@ -132,15 +132,14 @@ impl SshRemote {
         write_text(&mut self.to, &format!("put {}", hash.to_hex()))?;
         PktWriter::new(&mut self.to).write_all(encoded)?;
         write_flush(&mut self.to)?;
-        self.expect_ok()
+        Self::expect_ok(&mut self.from)
     }
 
     pub fn get_encoded(&mut self, hash: &blake3::Hash) -> Result<Vec<u8>> {
         use git_cdc_core::pktline::{PktReader, write_text};
         write_text(&mut self.to, &format!("get {}", hash.to_hex()))?;
         self.to.flush()?;
-        self.expect_ok()
-            .with_context(|| format!("fetching {}", hash.to_hex()))?;
+        Self::expect_ok(&mut self.from).with_context(|| format!("fetching {}", hash.to_hex()))?;
         let mut encoded = Vec::new();
         PktReader::new(&mut self.from).read_to_end(&mut encoded)?;
         Ok(encoded)
@@ -167,11 +166,36 @@ impl SshRemote {
         Ok(out)
     }
 
-    pub fn remove(&mut self, hash: &blake3::Hash) -> Result<()> {
+    pub fn remove_many(&mut self, hashes: &[blake3::Hash]) -> Result<()> {
         use git_cdc_core::pktline::write_text;
-        write_text(&mut self.to, &format!("remove {}", hash.to_hex()))?;
-        self.to.flush()?;
-        self.expect_ok()
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        // Keep the v1 wire protocol. Send requests while draining replies so
+        // large sweeps cannot deadlock when both transport pipes fill up.
+        let Self { child, to, from } = self;
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| -> Result<()> {
+                for hash in hashes {
+                    write_text(to, &format!("remove {}", hash.to_hex()))?;
+                }
+                to.flush()?;
+                Ok(())
+            });
+            let result: Result<()> = (|| {
+                for _ in hashes {
+                    Self::expect_ok(from)?;
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                // A refused reply must also unblock a sender whose pipe is full.
+                let _ = child.kill();
+            }
+            let send_result = sender.join().expect("ssh delete sender panicked");
+            result?;
+            send_result
+        })
     }
 }
 
@@ -253,4 +277,41 @@ pub fn remote() -> Result<Remote> {
     Ok(Remote::Http(git_cdc_core::client::Client::new(
         &url, &token,
     )))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refused_removal_preserves_remote_error_when_sender_breaks() {
+        let directory = tempfile::tempdir().unwrap();
+        let peer = directory.path().join("peer.sh");
+        fs::write(
+            &peer,
+            r#"set -eu
+read_packet() {
+    IFS= read -r -N 4 prefix
+    IFS= read -r -N "$((16#$prefix - 4))" payload
+}
+read_packet
+printf '0007ok\n'
+read_packet
+reply='err removal refused: permission denied'
+printf '%04x%s\n' "$((${#reply} + 5))" "$reply"
+"#,
+        )
+        .unwrap();
+        let mut remote =
+            SshRemote::connect(&["bash".into(), peer.to_str().unwrap().into()]).unwrap();
+        // Exceed the pipe capacity so the peer's exit also breaks the sender.
+        let hashes = vec![blake3::hash(b"refused chunk"); 65_536];
+        let error = remote.remove_many(&hashes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ssh remote: err removal refused: permission denied"),
+            "{error:#}"
+        );
+    }
 }

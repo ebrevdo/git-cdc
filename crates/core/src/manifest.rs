@@ -24,8 +24,8 @@ pub struct Manifest {
     pub chunks: Vec<Chunk>,
 }
 
-/// Cheap sniff used by smudge/push to tell manifests from arbitrary file
-/// content (passthrough safety, same idea as git-lfs pointer detection).
+/// Cheap candidate sniff for filters/scans. A matching first line alone
+/// does not identify a manifest: callers must parse the complete input.
 pub fn is_manifest(data: &[u8]) -> bool {
     match data.strip_prefix(VERSION_LINE.as_bytes()) {
         Some(rest) => rest.first() == Some(&b'\n'),

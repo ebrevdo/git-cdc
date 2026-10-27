@@ -164,3 +164,88 @@ fn walk_size(dir: &Path) -> u64 {
     }
     total
 }
+
+#[cfg(unix)]
+#[test]
+fn gc_pipelines_deletes_while_draining_remote_replies() {
+    use git_cdc_core::pktline::{write_flush, write_text};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    utils::base_setup_repo(&repo);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "empty live set"],
+    );
+    let listing = tmp.path().join("listing");
+    let mut output = fs::File::create(&listing).unwrap();
+    for i in 0u64..4096 {
+        write_text(
+            &mut output,
+            &format!("chunk {} 1", blake3::hash(&i.to_le_bytes()).to_hex()),
+        )
+        .unwrap();
+    }
+    write_flush(&mut output).unwrap();
+    let peer = tmp.path().join("peer.sh");
+    fs::write(
+        &peer,
+        r#"set -eu
+read_packet() {
+    IFS= read -r -N 4 prefix
+    IFS= read -r -N "$((16#$prefix - 4))" payload
+}
+read_packet
+printf '0007ok\n'
+read_packet
+cat "$1"
+# Reply in windows large enough to fill a pipe. A lockstep client cannot
+# reach the first reply, and a write-all-then-read client fills both pipes.
+for ((i = 0; i < 4096; i++)); do
+    read_packet
+    [[ "$payload" == remove\ * ]]
+    if ((i % 1024 == 1023)); then
+        for ((j = 0; j < 1024; j++)); do printf '0007ok\n'; done
+    fi
+done
+"#,
+    )
+    .unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "cdc.ssh.command",
+            &format!("bash {} {}", peer.display(), listing.display()),
+        ],
+    );
+    let mut child = Command::new(BIN)
+        .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["gc", "--grace-secs", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("SSH removal pipeline stalled");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ssh gc removed 4096 chunks"));
+}

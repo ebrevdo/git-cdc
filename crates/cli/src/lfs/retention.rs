@@ -41,17 +41,30 @@ pub(super) fn visit_objects(
     tips: &BTreeSet<String>,
     visit: impl FnMut(&str, u64) -> Result<()>,
 ) -> Result<()> {
-    visit_objects_with(tips, visit, git_without_replacements)
+    visit_pointers_with(tips, None, visit, git_without_replacements)
 }
 
-pub(super) fn visit_objects_with(
+pub(super) fn visit_candidates_with(
     tips: &BTreeSet<String>,
+    wanted: &BTreeMap<&str, u64>,
+    visit: impl FnMut(&str, u64) -> Result<()>,
+    command: impl FnMut() -> Command,
+) -> Result<()> {
+    let paths: BTreeSet<_> = wanted.keys().map(|oid| pointer_path(oid)).collect();
+    visit_pointers_with(tips, Some(&paths), visit, command)
+}
+
+fn visit_pointers_with(
+    tips: &BTreeSet<String>,
+    paths: Option<&BTreeSet<String>>,
     mut visit: impl FnMut(&str, u64) -> Result<()>,
     command: impl FnMut() -> Command,
 ) -> Result<()> {
     visit_blobs_with(
         tips,
         &BTreeSet::new(),
+        None,
+        paths,
         |head| head.starts_with(LFS_POINTER_VERSION.as_bytes()),
         |body| {
             // Our managed roots always contain canonical three-line SHA-256
@@ -189,6 +202,14 @@ fn write_blob(output: &mut impl Write, mark: usize, contents: &str) -> Result<()
 }
 
 pub(super) fn stage(objects: &BTreeMap<String, u64>, parents: &[String]) -> Result<String> {
+    stage_with(objects, parents, git_without_replacements())
+}
+
+pub(super) fn stage_with(
+    objects: &BTreeMap<String, u64>,
+    parents: &[String],
+    mut command: Command,
+) -> Result<String> {
     let staging = tempfile::tempdir()?;
     let temporary = format!(
         "{PREFIX}pending-{}",
@@ -233,7 +254,7 @@ pub(super) fn stage(objects: &BTreeMap<String, u64>, parents: &[String]) -> Resu
     hooks.push(staging.path());
     let mut export = std::ffi::OsString::from("--export-marks=");
     export.push(&marks);
-    let status = git_without_replacements()
+    let status = command
         .arg("-c")
         .arg(hooks)
         .args(["fast-import", "--quiet", "--done"])

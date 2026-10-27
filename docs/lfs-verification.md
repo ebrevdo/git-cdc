@@ -115,7 +115,7 @@ predates these publication fixes.
 |---|---|
 | 12 MiB deterministic file, default 512 KiB / 2 MiB / 8 MiB bounds, one bit changed | 5 original chunks; 1 new chunk; 2,170,503 uploaded payload bytes |
 | Same size/data seed, test 64 KiB / 256 KiB / 1 MiB bounds, one byte changed | 48 original chunks; 1 new chunk; 306,415 uploaded payload bytes |
-| 256 MiB file | Correct staging, push and restoration; filter-process also reconstructed under a 192 MiB address-space limit |
+| 128 MiB file through `lfs-filter-process` | Clean and smudge both succeed under a 96 MiB address-space limit; the recipe's oid and size and the reconstructed bytes match the input |
 | Sustained upload interruption | Cut after 8,192 of 646,690 object bytes; user ref unchanged; 1 completed new object retained; retry sent only the 13 missing objects |
 
 HTTP upload-request counts and server object contents verify the incremental

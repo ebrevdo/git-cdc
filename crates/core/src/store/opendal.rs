@@ -87,10 +87,48 @@ impl OpendalStore {
         Ok(())
     }
 
-    /// All chunks under the prefix with their last-modified age — GC's
-    /// grace period needs it. Falls back to a per-entry stat when the
-    /// service's listing omits timestamps; `None` if that fails too.
-    pub async fn list(&self) -> Result<Vec<(blake3::Hash, Option<SystemTime>)>> {
+    /// Use service-native batches where available (for example S3's 1,000
+    /// keys), with bounded concurrency for both batches and single deletes.
+    pub async fn remove_many(&self, hashes: &[blake3::Hash]) -> Result<()> {
+        const CONCURRENT_DELETES: usize = 16;
+        let batch_size = self
+            .op
+            .info()
+            .full_capability()
+            .delete_max_size
+            .unwrap_or(1)
+            .clamp(1, 1000);
+        let mut tasks = tokio::task::JoinSet::new();
+        for batch in hashes.chunks(batch_size) {
+            let op = self.op.clone();
+            let keys: Vec<_> = batch.iter().map(|hash| self.key(hash)).collect();
+            tasks.spawn(async move { op.delete_iter(keys).await });
+            if tasks.len() == CONCURRENT_DELETES {
+                tasks
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .context("opendal delete task")??;
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.context("opendal delete task")??;
+        }
+        Ok(())
+    }
+
+    /// Chunk names without per-object metadata requests. Transfers and local
+    /// eviction only need presence; only GC needs last-modified timestamps.
+    pub async fn list_names(&self) -> Result<Vec<blake3::Hash>> {
+        Ok(self
+            .chunk_entries()
+            .await?
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect())
+    }
+
+    async fn chunk_entries(&self) -> Result<Vec<(blake3::Hash, opendal::Entry)>> {
         let path = if self.prefix.is_empty() {
             "/"
         } else {
@@ -102,19 +140,26 @@ impl OpendalStore {
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e).context("opendal list"),
         };
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .filter_map(|entry| {
+                // Foreign objects under the prefix are not ours to GC.
+                blake3::Hash::from_hex(entry.name())
+                    .ok()
+                    .map(|hash| (hash, entry))
+            })
+            .collect())
+    }
+
+    /// All chunks under the prefix with their last-modified age — GC's
+    /// grace period needs it. Falls back to a per-entry stat when the
+    /// service's listing omits timestamps; `None` if that fails too.
+    pub async fn list(&self) -> Result<Vec<(blake3::Hash, Option<SystemTime>)>> {
         let mut out = Vec::new();
-        for entry in entries {
-            if !entry.metadata().is_file() {
-                continue;
-            }
-            let Ok(hash) = blake3::Hash::from_hex(entry.name()) else {
-                continue; // foreign object under our prefix — not ours to GC
-            };
+        for (hash, entry) in self.chunk_entries().await? {
             let mut modified = entry.metadata().last_modified();
             if modified.is_none() {
-                // ponytail: sequential stat per entry when a service's
-                // listing omits timestamps — batch/parallelize if GC over
-                // such a service ever gets slow.
                 modified = self
                     .op
                     .stat(entry.path())
@@ -125,5 +170,80 @@ impl OpendalStore {
             out.push((hash, modified.map(SystemTime::from)));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opendal::raw::{Access, AccessorInfo, OpList, OpStat, RpList, RpStat, oio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct MissingTimestamps {
+        stats: Arc<AtomicUsize>,
+    }
+
+    impl Access for MissingTimestamps {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> Arc<AccessorInfo> {
+            let info = AccessorInfo::default();
+            info.set_scheme("test");
+            info.set_native_capability(opendal::Capability {
+                list: true,
+                stat: true,
+                ..Default::default()
+            });
+            Arc::new(info)
+        }
+
+        async fn list(&self, _: &str, _: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            let hash = blake3::hash(b"listed chunk");
+            Ok((
+                RpList::default(),
+                Box::new(Entries(Some(oio::Entry::new(
+                    &format!("chunks/{}", hash.to_hex()),
+                    opendal::Metadata::new(opendal::EntryMode::FILE),
+                )))),
+            ))
+        }
+
+        async fn stat(&self, _: &str, _: OpStat) -> opendal::Result<RpStat> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            Err(opendal::Error::new(
+                opendal::ErrorKind::PermissionDenied,
+                "unavailable timestamp",
+            ))
+        }
+    }
+
+    struct Entries(Option<oio::Entry>);
+
+    impl oio::List for Entries {
+        async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
+            Ok(self.0.take())
+        }
+    }
+
+    #[tokio::test]
+    async fn names_only_listing_never_stats_and_gc_keeps_unknown_ages() {
+        let stats = Arc::new(AtomicUsize::new(0));
+        let store = OpendalStore {
+            op: opendal::Operator::from_inner(Arc::new(MissingTimestamps {
+                stats: stats.clone(),
+            })),
+            prefix: "chunks/".into(),
+        };
+        let hash = blake3::hash(b"listed chunk");
+        assert_eq!(store.list_names().await.unwrap(), vec![hash]);
+        assert_eq!(stats.load(Ordering::SeqCst), 0);
+        assert_eq!(store.list().await.unwrap(), vec![(hash, None)]);
+        assert_eq!(stats.load(Ordering::SeqCst), 1);
     }
 }

@@ -1,58 +1,62 @@
 //! The clean/smudge filters: one-shot commands and the long-running
 //! filter-process protocol.
 
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 
 use anyhow::{Result, bail};
 use git_cdc_core::chunker::{ChunkParams, chunk_stream};
-use git_cdc_core::manifest::{Manifest, is_manifest};
+use git_cdc_core::manifest::Manifest;
 use git_cdc_core::store::{ChunkStore, DiskStore};
 
 use crate::git::{ChunkParamsFor, chunk_params, local_store};
+use crate::manifest::read_candidate;
 
 /// Clean: file content in, manifest out. Shared by the one-shot filter and
 /// the filter-process loop.
 ///
-/// Peeks far enough to recognize a manifest: re-cleaning passed-through
-/// manifest text (fresh clone worktree state) must not chunk the manifest
-/// itself — it passes through unchanged, same as git-lfs does for pointers.
+/// Valid recipes for this backend pass through unchanged so re-cleaning a
+/// pointer-only checkout never chunks the manifest text itself.
 fn clean_stream(
-    mut reader: impl Read,
+    reader: impl Read,
     mut writer: impl Write,
     store: &DiskStore,
     params: ChunkParams,
 ) -> Result<()> {
-    let mut head = Vec::with_capacity(64);
-    (&mut reader).take(64).read_to_end(&mut head)?;
-    if is_manifest(&head) {
-        writer.write_all(&head)?;
-        std::io::copy(&mut reader, &mut writer)?;
+    let mut reader = BufReader::with_capacity(64, reader);
+    let (prefix, manifest) = read_candidate(&mut reader, false)?;
+    if manifest.is_some() {
+        writer.write_all(&prefix)?;
         return Ok(());
     }
-    let input = head.as_slice().chain(reader);
-    let (chunks, oid, size) = chunk_stream(input, params, |c, bytes| store.put(&c.hash, bytes))?;
+    let input = prefix.as_slice().chain(reader);
+    let (chunks, oid, size) = chunk_stream(input, params, |c, bytes| {
+        // The chunker already computed this hash from these bytes.
+        if store.has(&c.hash) {
+            Ok(())
+        } else {
+            store.put(&c.hash, bytes)
+        }
+    })?;
     writer.write_all(Manifest::new(oid, size, chunks, params).encode().as_bytes())?;
     Ok(())
 }
 
 /// Smudge: manifest in, file content out (shared like `clean_stream`).
-/// The passthrough case (file committed before tracking) can be arbitrarily
-/// large and must stream, not buffer — hence the same 64-byte peek.
-fn smudge_stream(mut reader: impl Read, mut writer: impl Write, store: &DiskStore) -> Result<()> {
-    let mut input = Vec::with_capacity(64);
-    (&mut reader).take(64).read_to_end(&mut input)?;
-    if !is_manifest(&input) {
-        writer.write_all(&input)?;
+/// Non-manifest input streams through unchanged, including files committed
+/// before tracking.
+fn smudge_stream(reader: impl Read, mut writer: impl Write, store: &DiskStore) -> Result<()> {
+    let mut reader = BufReader::with_capacity(64, reader);
+    let (prefix, manifest) = read_candidate(&mut reader, false)?;
+    let Some(m) = manifest else {
+        writer.write_all(&prefix)?;
         std::io::copy(&mut reader, &mut writer)?;
         return Ok(());
-    }
-    reader.read_to_end(&mut input)?; // manifests are small
-    let m = Manifest::parse(&input)?;
+    };
 
     if m.chunks.iter().any(|c| !store.has(&c.hash)) {
         // Fresh clone / chunks not fetched yet: write the manifest through
         // so checkout succeeds, and tell the user how to materialize.
-        writer.write_all(&input)?;
+        writer.write_all(&prefix)?;
         eprintln!("git-cdc: chunks not in local store; run `git cdc pull` to fetch file content");
         return Ok(());
     }

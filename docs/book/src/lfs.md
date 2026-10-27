@@ -103,6 +103,11 @@ Before Git updates any remote refs, the pre-push hook uploads every chunk the
 pushed history needs that the LFS server does not already have. If an upload
 fails, the push fails. Later pushes only scan new history.
 
+If a push needs chunks that aren't in the local cache, for example when
+mirroring history, it downloads them in batches of up to 64 MiB and removes
+them afterwards. To use less temporary disk, lower the limit with
+`git config cdc.lfs.transferBatchBytes 16m`.
+
 The hook then pushes a small internal ref under `refs/notes/git-cdc-lfs/`. It
 holds ordinary LFS pointers to the uploaded chunks, so servers that delete
 unreferenced LFS objects keep them. Do not delete these refs. They appear in

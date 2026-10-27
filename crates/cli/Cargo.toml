@@ -21,3 +21,6 @@ tokio = { version = "1.52.4", features = ["rt"] }
 axum = "0.8.9"
 git-cdc-server = { path = "../server" }
 tokio = { version = "1.52.4", features = ["rt-multi-thread", "net", "macros"] }
+
+[target."cfg(unix)".dependencies]
+signal-hook = "0.3"

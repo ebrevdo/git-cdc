@@ -7,8 +7,10 @@ use git_cdc_core::manifest::Manifest;
 
 mod filter;
 mod git;
+mod history;
 mod lfs;
 mod lifecycle;
+mod manifest;
 mod remote;
 mod sync;
 
@@ -264,15 +266,8 @@ fn cmd_diff(from: &PathBuf, to: &PathBuf) -> Result<()> {
 
 /// No-argument form: every tracked file, HEAD manifest vs index manifest.
 fn cmd_diff_repo() -> Result<()> {
-    use git_cdc_core::manifest::is_manifest;
     let mut changed = 0usize;
-    for (path, index) in git::index_manifests()? {
-        let head = std::process::Command::new("git")
-            .args(["show", &format!("HEAD:{path}")])
-            .output()?;
-        let head = (head.status.success() && is_manifest(&head.stdout))
-            .then(|| Manifest::parse(&head.stdout))
-            .transpose()?;
+    for (path, index, head) in git::diff_manifests()? {
         let (added_n, added, removed_n, removed, total) = diff_stats(head.as_ref(), Some(&index));
         if added_n == 0 && removed_n == 0 {
             continue;

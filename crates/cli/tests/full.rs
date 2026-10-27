@@ -5,6 +5,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use git_cdc_core::chunker::test_util::test_data;
@@ -18,6 +20,44 @@ use utils::{BIN, cdc, git, git_cmd};
 const TOKEN: &str = "e2e-token";
 
 fn spawn_server(root: PathBuf, grace: Duration) -> String {
+    spawn_server_observed(root, grace, None)
+}
+
+#[derive(Default)]
+struct Downloads {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    waited: AtomicBool,
+    overlap: tokio::sync::Notify,
+}
+
+async fn observe_downloads(
+    axum::extract::State(downloads): axum::extract::State<Arc<Downloads>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.method() != axum::http::Method::GET || !req.uri().path().starts_with("/chunks/") {
+        return next.run(req).await;
+    }
+    let active = downloads.active.fetch_add(1, Ordering::SeqCst) + 1;
+    downloads.peak.fetch_max(active, Ordering::SeqCst);
+    if active > 1 {
+        downloads.overlap.notify_one();
+    } else if !downloads.waited.swap(true, Ordering::SeqCst) {
+        // Hold the first request until another arrives. A
+        // sequential downloader times out and fails the overlap assertion.
+        let _ = tokio::time::timeout(Duration::from_secs(2), downloads.overlap.notified()).await;
+    }
+    let response = next.run(req).await;
+    downloads.active.fetch_sub(1, Ordering::SeqCst);
+    response
+}
+
+fn spawn_server_observed(
+    root: PathBuf,
+    grace: Duration,
+    downloads: Option<Arc<Downloads>>,
+) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -34,10 +74,52 @@ fn spawn_server(root: PathBuf, grace: Duration) -> String {
                 grace,
                 upload_times: Default::default(),
             };
-            axum::serve(listener, app(state)).await.unwrap();
+            let mut router = app(state);
+            if let Some(downloads) = downloads {
+                router = router.layer(axum::middleware::from_fn_with_state(
+                    downloads,
+                    observe_downloads,
+                ));
+            }
+            axum::serve(listener, router).await.unwrap();
         });
     });
     rx.recv().unwrap()
+}
+
+#[test]
+fn pull_downloads_http_chunks_concurrently_with_a_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let downloads = Arc::new(Downloads::default());
+    let url = spawn_server_observed(
+        tmp.path().join("server/objects"),
+        Duration::ZERO,
+        Some(downloads.clone()),
+    );
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    setup_repo(&repo, &url);
+    cdc(&repo, &["track", "*.bin"]);
+    for key in ["cdc.chunk.min", "cdc.chunk.avg", "cdc.chunk.max"] {
+        git(&repo, &["config", key, "64k"]);
+    }
+    let data = test_data(1024 * 1024, 941);
+    fs::write(repo.join("asset.bin"), &data).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "concurrent download fixture"]);
+    cdc(&repo, &["push"]);
+    cdc(&repo, &["drop", "--all"]);
+    let index = git(&repo, &["ls-files", "--stage", "-z"]);
+    fs::remove_dir_all(repo.join(".git/cdc/objects")).unwrap();
+    cdc(&repo, &["pull"]);
+    assert_eq!(fs::read(repo.join("asset.bin")).unwrap(), data);
+    assert_eq!(git(&repo, &["ls-files", "--stage", "-z"]), index);
+    let peak = downloads.peak.load(Ordering::SeqCst);
+    assert!(
+        (2..=4).contains(&peak),
+        "expected bounded concurrent downloads, observed {peak}"
+    );
 }
 
 fn setup_repo(repo: &Path, server_url: &str) {

@@ -9,14 +9,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-use git_cdc_core::manifest::{Manifest, is_manifest};
+use git_cdc_core::manifest::Manifest;
 
-use crate::git::{git_out, manifests_from, repo_root};
+use crate::git::{ManifestScan, git_bytes, git_out, input_file, repo_root, visit_index_blobs};
+use crate::manifest::detect;
 
 mod backend;
+mod lock;
 use backend::{Backends, Presence};
-
-const MAX_RECIPE_BYTES: u64 = 16 * 1024 * 1024;
+use lock::IndexLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BackendKind {
@@ -117,74 +118,34 @@ struct IndexedFile {
     manifest: Manifest,
 }
 
-fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "git {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(output.stdout)
-}
-
-/// NUL-delimited index/attribute records preserve whitespace and newlines in
-/// paths. Keep the original blob and mode, including staged snapshots.
 fn index_files(root: &Path) -> Result<Vec<IndexedFile>> {
-    let listed = git_bytes(root, &["ls-files", "--stage", "--full-name", "-z"])?;
     let mut files = Vec::new();
-    for entry in listed.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
-        let tab = entry
-            .iter()
-            .position(|b| *b == b'\t')
-            .context("invalid index entry")?;
-        let (meta, path) = entry.split_at(tab);
-        let path = std::str::from_utf8(&path[1..]).context("non-UTF-8 CDC path")?;
-        let fields: Vec<_> = std::str::from_utf8(meta)?.split_whitespace().collect();
-        let [mode, oid, stage] = fields.as_slice() else {
-            bail!("invalid index metadata");
-        };
-        if !matches!(*mode, "100644" | "100755") {
-            continue;
-        }
-        let attribute = git_bytes(
-            root,
-            &["check-attr", "--cached", "-z", "filter", "--", path],
-        )?;
-        let filter = attribute.split(|b| *b == 0).nth(2).unwrap_or_default();
-        if !matches!(filter, b"cdc" | b"cdc-lfs") {
-            continue;
-        }
-        let size = String::from_utf8(git_bytes(root, &["cat-file", "-s", oid])?)?
-            .trim()
-            .parse::<u64>()?;
-        if size > MAX_RECIPE_BYTES {
-            continue;
-        }
-        let blob = git_bytes(root, &["cat-file", "blob", oid])?;
-        if !is_manifest(&blob) {
-            continue;
-        }
-        let manifest = Manifest::parse(&blob)?;
-        let is_lfs = manifest.extra.get("storage").map(String::as_str) == Some("git-lfs-v1");
-        ensure!(
-            (filter == b"cdc-lfs") == is_lfs,
-            "CDC filter/backend mismatch for {path:?}"
-        );
-        objects(&manifest)?;
-        files.push(IndexedFile {
-            path: path.to_owned(),
-            mode: mode.to_string(),
-            blob_oid: oid.to_string(),
-            stage: stage.parse()?,
-            blob,
-            manifest,
-        });
-    }
+    visit_index_blobs(
+        root,
+        true,
+        |filter| matches!(filter, b"cdc" | b"cdc-lfs"),
+        |entry| {
+            let Some(manifest) = detect(&entry.blob) else {
+                return Ok(());
+            };
+            let is_lfs = manifest.extra.get("storage").map(String::as_str) == Some("git-lfs-v1");
+            ensure!(
+                (entry.filter == b"cdc-lfs") == is_lfs,
+                "CDC filter/backend mismatch for {:?}",
+                entry.path
+            );
+            objects(&manifest)?;
+            files.push(IndexedFile {
+                path: entry.path,
+                mode: entry.mode,
+                blob_oid: entry.blob_oid,
+                stage: entry.stage,
+                blob: entry.blob,
+                manifest,
+            });
+            Ok(())
+        },
+    )?;
     Ok(files)
 }
 
@@ -192,21 +153,31 @@ fn select(files: &[IndexedFile], paths: &[String], all: bool) -> Result<Vec<usiz
     if all {
         return Ok((0..files.len()).filter(|i| files[*i].stage == 0).collect());
     }
-    let mut args = vec!["ls-files", "--full-name", "-z", "--"];
+    let mut args = vec!["ls-files", "--error-unmatch", "--full-name", "-z", "--"];
     args.extend(paths.iter().map(String::as_str));
     let output = Command::new("git").args(args).output()?;
-    ensure!(output.status.success(), "cannot resolve CDC paths");
+    ensure!(
+        output.status.success(),
+        "cannot resolve CDC paths: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
+    let indexed: HashMap<_, _> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.stage == 0)
+        .map(|(i, file)| (file.path.as_str(), i))
+        .collect();
     for path in output
         .stdout
         .split(|b| *b == 0)
         .filter(|path| !path.is_empty())
     {
         let path = std::str::from_utf8(path)?;
-        let i = files
-            .iter()
-            .position(|file| file.path == path && file.stage == 0)
+        let i = indexed
+            .get(path)
+            .copied()
             .with_context(|| format!("{path:?} is not an unmerged-free indexed CDC file"))?;
         if seen.insert(i) {
             selected.push(i);
@@ -216,17 +187,6 @@ fn select(files: &[IndexedFile], paths: &[String], all: bool) -> Result<Vec<usiz
         !selected.is_empty(),
         "no indexed CDC files match the selected paths"
     );
-    // Git pathspec expansion can ignore one unmatched argument. Diagnose each
-    // explicit selection before any worktree operation.
-    for path in paths {
-        let out = Command::new("git")
-            .args(["ls-files", "-z", "--", path])
-            .output()?;
-        ensure!(
-            out.status.success() && !out.stdout.is_empty(),
-            "{path:?}: no such file tracked by git"
-        );
-    }
     Ok(selected)
 }
 
@@ -238,7 +198,7 @@ enum FileState {
     Modified,
 }
 
-fn file_state(root: &Path, file: &IndexedFile) -> Result<FileState> {
+fn file_state(root: &Path, file: &IndexedFile, verify_content: bool) -> Result<FileState> {
     let path = root.join(&file.path);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -260,7 +220,9 @@ fn file_state(root: &Path, file: &IndexedFile) -> Result<FileState> {
     if metadata.len() == file.blob.len() as u64 && fs::read(&path)? == file.blob {
         return Ok(FileState::Recipe);
     }
-    if metadata.len() != file.manifest.size {
+    // Pull only replaces exact recipes or missing files. It does not need
+    // to distinguish edited content from already-hydrated content.
+    if !verify_content || metadata.len() != file.manifest.size {
         return Ok(FileState::Modified);
     }
     let mut hash = blake3::Hasher::new();
@@ -272,14 +234,29 @@ fn file_state(root: &Path, file: &IndexedFile) -> Result<FileState> {
     })
 }
 
-fn check_index(root: &Path, file: &IndexedFile) -> Result<()> {
-    let current = git_bytes(root, &["ls-files", "--stage", "-z", "--", &file.path])?;
-    let expected = format!("{} {} 0\t{}\0", file.mode, file.blob_oid, file.path);
-    ensure!(
-        current == expected.as_bytes(),
-        "index changed while processing {:?}",
-        file.path
-    );
+fn check_index(root: &Path, files: &[&IndexedFile]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let current = git_bytes(root, &["ls-files", "--stage", "-z"])?;
+    let mut entries: HashMap<&[u8], Vec<&[u8]>> = HashMap::new();
+    for entry in current.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .context("invalid index entry")?;
+        entries.entry(&entry[tab + 1..]).or_default().push(entry);
+    }
+    for file in files {
+        let expected = format!("{} {} 0\t{}", file.mode, file.blob_oid, file.path);
+        ensure!(
+            entries
+                .get(file.path.as_bytes())
+                .is_some_and(|entries| entries.as_slice() == [expected.as_bytes()]),
+            "index changed while processing {:?}",
+            file.path
+        );
+    }
     Ok(())
 }
 
@@ -305,42 +282,112 @@ fn prepare_file(root: &Path, file: &IndexedFile) -> Result<tempfile::NamedTempFi
     Ok(temporary)
 }
 
-fn replace(
-    root: &Path,
-    file: &IndexedFile,
-    expected: FileState,
+struct IndexUpdate<'a> {
+    root: &'a Path,
+    index: PathBuf,
+    lock: IndexLock,
     temporary: tempfile::NamedTempFile,
-) -> Result<()> {
-    temporary.as_file().sync_all()?;
-    check_index(root, file)?;
-    ensure!(
-        file_state(root, file)? == expected,
-        "working file changed while processing {:?}",
-        file.path
-    );
-    let path = root.join(&file.path);
-    temporary.persist(&path)?;
-    #[cfg(unix)]
-    File::open(path.parent().context("CDC file directory")?)?.sync_all()?;
-    // Reset stat data using the SAME blob/mode. Never re-add/re-chunk content
-    // merely to settle Git's view of a hydrated or dehydrated file.
-    let entry = format!("{},{},{}", file.mode, file.blob_oid, file.path);
-    git_bytes(root, &["update-index", "--cacheinfo", &entry])?;
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["update-index", "--refresh"])
-        .output()?;
-    Ok(())
+    entries: Vec<u8>,
+}
+
+impl<'a> IndexUpdate<'a> {
+    fn new(root: &'a Path, files: &[&IndexedFile]) -> Result<Self> {
+        let path = String::from_utf8(git_bytes(root, &["rev-parse", "--git-path", "index"])?)?;
+        let index = root.join(path.strip_suffix('\n').context("invalid Git index path")?);
+        let mut lock = index.as_os_str().to_os_string();
+        lock.push(".lock");
+        let temporary = tempfile::Builder::new()
+            .prefix(".git-cdc-index-")
+            .tempfile_in(index.parent().context("Git index directory")?)?;
+        let lock = IndexLock::acquire(PathBuf::from(lock), temporary.path())?;
+        let update = Self {
+            root,
+            index,
+            lock,
+            temporary,
+            entries: Vec::new(),
+        };
+        fs::copy(&update.index, update.temporary.path())?;
+        check_index(root, files)?;
+        Ok(update)
+    }
+
+    fn replace(
+        &mut self,
+        file: &IndexedFile,
+        expected: FileState,
+        temporary: tempfile::NamedTempFile,
+    ) -> Result<()> {
+        // Dehydration must be durable before evicting chunks. Hydration only
+        // recreates content and follows Git's normal worktree durability policy.
+        let durable = expected == FileState::Content;
+        if durable {
+            temporary.as_file().sync_all()?;
+        }
+        ensure!(
+            file_state(self.root, file, durable)? == expected,
+            "working file changed while processing {:?}",
+            file.path
+        );
+        let path = self.root.join(&file.path);
+        temporary.persist(&path)?;
+        write!(
+            self.entries,
+            "{} {}\t{}\0",
+            file.mode, file.blob_oid, file.path
+        )?;
+        #[cfg(unix)]
+        if durable {
+            File::open(path.parent().context("CDC file directory")?)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(self.root)
+            .env("GIT_INDEX_FILE", self.temporary.path());
+        command
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        // Git writes a separate private index: a surviving child must never
+        // recreate the real index.lock after signal cleanup removes it.
+        let output = self
+            .command()
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(input_file(&self.entries)?)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "cannot reset CDC index stat data: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = self
+            .command()
+            .args(["update-index", "--refresh"])
+            .output()?;
+        self.lock.publish(self.temporary, &self.index)?;
+        Ok(())
+    }
 }
 
 fn reassemble(file: &IndexedFile, backends: &Backends, mut output: impl Write) -> Result<()> {
     let references = objects(&file.manifest)?;
     let mut hasher = blake3::Hasher::new();
     for (chunk, object) in file.manifest.chunks.iter().zip(references) {
-        let bytes = backends.get(object.id.backend()).read(&object)?;
+        let backend = object.id.backend();
+        let bytes = backends.get(backend).read(&object)?;
+        // DiskStore already verifies BLAKE3. LFS cache reads verify SHA-256,
+        // so those bytes still need their CDC chunk-hash check here.
         ensure!(
-            bytes.len() as u64 == object.size && blake3::hash(&bytes) == chunk.hash,
+            bytes.len() as u64 == object.size
+                && (backend == BackendKind::Legacy || blake3::hash(&bytes) == chunk.hash),
             "corrupt CDC chunk for {:?}",
             file.path
         );
@@ -366,10 +413,23 @@ pub fn pull(paths: &[String]) -> Result<()> {
     let root = repo_root()?;
     let files = index_files(&root)?;
     let selected = select(&files, paths, paths.is_empty())?;
+    let mut planned = Vec::new();
+    for i in &selected {
+        let file = &files[*i];
+        let state = file_state(&root, file, false)?;
+        if state == FileState::Recipe || (state == FileState::Missing && !paths.is_empty()) {
+            planned.push((file, state));
+        }
+    }
+    if planned.is_empty() {
+        eprintln!("git-cdc: materialized 0 files");
+        warn_chunk_param_mismatch(selected.iter().map(|i| &files[*i].manifest));
+        return Ok(());
+    }
     let backends = Backends::new()?;
     let mut needed = HashMap::new();
-    for i in &selected {
-        add_objects(&mut needed, &files[*i].manifest)?;
+    for (file, _) in &planned {
+        add_objects(&mut needed, &file.manifest)?;
     }
     for kind in [BackendKind::Legacy, BackendKind::Lfs] {
         let objects = by_backend(needed.values(), kind);
@@ -377,21 +437,22 @@ pub fn pull(paths: &[String]) -> Result<()> {
             backends.get(kind).fetch(&objects)?;
         }
     }
-    let mut materialized = 0;
-    for i in &selected {
-        let file = &files[*i];
-        let state = file_state(&root, file)?;
-        match state {
-            FileState::Recipe => {}
-            FileState::Missing if !paths.is_empty() => {}
-            _ => continue,
+    let mut index = IndexUpdate::new(
+        &root,
+        &planned.iter().map(|(file, _)| *file).collect::<Vec<_>>(),
+    )?;
+    let result = (|| {
+        for (file, state) in &planned {
+            let mut temporary = prepare_file(&root, file)?;
+            reassemble(file, &backends, &mut temporary)?;
+            index.replace(file, *state, temporary)?;
         }
-        let mut temporary = prepare_file(&root, file)?;
-        reassemble(file, &backends, &mut temporary)?;
-        replace(&root, file, state, temporary)?;
-        materialized += 1;
-    }
-    eprintln!("git-cdc: materialized {materialized} files");
+        anyhow::Ok(())
+    })();
+    let refreshed = index.finish();
+    result?;
+    refreshed?;
+    eprintln!("git-cdc: materialized {} files", planned.len());
     warn_chunk_param_mismatch(selected.iter().map(|i| &files[*i].manifest));
     Ok(())
 }
@@ -466,15 +527,16 @@ fn plan_drop(
         skipped: 0,
     };
     let mut pinned = HashMap::new();
+    let selected_set: HashSet<_> = selected.iter().copied().collect();
     for (i, file) in files.iter().enumerate() {
-        if !selected.contains(&i) {
+        if !selected_set.contains(&i) {
             add_objects(&mut pinned, &file.manifest)?;
         }
     }
     let mut modified = 0;
     for i in selected {
         let file = &files[*i];
-        let state = file_state(root, file)?;
+        let state = file_state(root, file, true)?;
         match state {
             FileState::Modified | FileState::Missing => {
                 if state == FileState::Modified {
@@ -600,25 +662,36 @@ pub fn drop_files(paths: &[String], all: bool, chunks: bool, dry_run: bool) -> R
     let plan = plan_drop(&root, &files, &selected, &backends, chunks)?;
     // Every remote proof is obtained before replacing any working files.
     let verified = verify(&plan.candidates, &backends, dry_run)?;
+    let planned: Vec<_> = plan.files.iter().map(|(i, _)| &files[*i]).collect();
+    let mut index = if dry_run || planned.is_empty() {
+        None
+    } else {
+        Some(IndexUpdate::new(&root, &planned)?)
+    };
     let mut freed = 0;
     let mut dropped = 0;
-    for (i, state) in &plan.files {
-        let file = &files[*i];
-        if *state != FileState::Content {
-            continue;
+    let result = (|| {
+        for (i, state) in &plan.files {
+            let file = &files[*i];
+            if *state != FileState::Content {
+                continue;
+            }
+            if let Some(index) = &mut index {
+                let mut temporary = prepare_file(&root, file)?;
+                temporary.write_all(&file.blob)?;
+                index.replace(file, *state, temporary)?;
+            }
+            freed += file.manifest.size.saturating_sub(file.blob.len() as u64);
+            dropped += 1;
         }
-        if !dry_run {
-            let mut temporary = prepare_file(&root, file)?;
-            temporary.write_all(&file.blob)?;
-            replace(&root, file, *state, temporary)?;
+        if dry_run {
+            check_index(&root, &planned)?;
         }
-        freed += file.manifest.size.saturating_sub(file.blob.len() as u64);
-        dropped += 1;
-    }
-    for (i, _) in &plan.files {
-        check_index(&root, &files[*i])?;
-    }
-    let chunk_bytes = evict_verified(&plan.candidates, &verified, &backends, dry_run)?;
+        evict_verified(&plan.candidates, &verified, &backends, dry_run)
+    })();
+    let refreshed = index.map(IndexUpdate::finish).transpose();
+    let chunk_bytes = result?;
+    refreshed?;
     let verb = if dry_run { "would drop" } else { "dropped" };
     eprintln!(
         "git-cdc: {verb} {dropped} files ({} skipped), {} local chunks; {freed} bytes of worktree + {chunk_bytes} bytes of chunks freed",
@@ -670,9 +743,10 @@ pub fn prune(dry_run: bool) -> Result<()> {
     let root = repo_root()?;
     let snapshot = protection_snapshot(&root)?;
     let mut known = HashMap::new();
-    for manifest in manifests_from(&["--all".into()])? {
-        add_objects(&mut known, &manifest)?;
-    }
+    let mut scan = ManifestScan::new()?;
+    scan.visit(&["--all".into()], |manifest| {
+        add_objects(&mut known, manifest)
+    })?;
     let mut protected = HashMap::new();
     for worktree in worktree_roots(&root)? {
         for file in index_files(&worktree)? {
@@ -681,15 +755,16 @@ pub fn prune(dry_run: bool) -> Result<()> {
         }
         let head = git_bytes(&worktree, &["rev-parse", "--verify", "HEAD"])?;
         let head = String::from_utf8(head)?.trim().to_owned();
-        for manifest in manifests_from(&["--no-walk".into(), head])? {
-            add_objects(&mut protected, &manifest)?;
-        }
+        scan.visit(&["--no-walk".into(), head], |manifest| {
+            add_objects(&mut protected, manifest)
+        })?;
     }
     // Reachability alone is not permission to evict: preserve local-only
     // histories, plus every stash reflog entry (not just refs/stash's tip).
-    for manifest in manifests_from(&["--all".into(), "--not".into(), "--remotes=origin".into()])? {
-        add_objects(&mut protected, &manifest)?;
-    }
+    scan.visit(
+        &["--all".into(), "--not".into(), "--remotes=origin".into()],
+        |manifest| add_objects(&mut protected, manifest),
+    )?;
     if git_out(&["rev-parse", "--verify", "--quiet", "refs/stash"]).is_ok() {
         let stash = git_out(&["reflog", "show", "--format=%H", "refs/stash"])?;
         let mut revisions = vec!["--no-walk".to_owned()];
@@ -700,10 +775,10 @@ pub fn prune(dry_run: bool) -> Result<()> {
             let parents = git_out(&["show", "--no-patch", "--format=%P", oid])?;
             revisions.extend(parents.split_whitespace().skip(1).map(str::to_owned));
         }
-        for manifest in manifests_from(&revisions)? {
-            add_objects(&mut protected, &manifest)?;
-            add_objects(&mut known, &manifest)?;
-        }
+        scan.visit(&revisions, |manifest| {
+            add_objects(&mut protected, manifest)?;
+            add_objects(&mut known, manifest)
+        })?;
     }
     let backends = Backends::new()?;
     let mut candidates = HashMap::new();

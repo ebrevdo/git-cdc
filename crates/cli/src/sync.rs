@@ -2,10 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use git_cdc_core::protocol::{ObjectSpec, Operation};
+use git_cdc_core::protocol::{ObjectResult, ObjectSpec, Operation};
 use git_cdc_core::store::ChunkStore;
 
 use crate::git::{all_manifests, local_store, oid_str};
@@ -34,7 +36,7 @@ pub(crate) fn remote_present(chunks: &HashMap<blake3::Hash, u64>) -> Result<Hash
         return Ok(HashSet::new());
     }
     // The serverless remotes answer with one listing, same as `cmd_push`.
-    let intersect = |present: HashSet<blake3::Hash>| -> HashSet<blake3::Hash> {
+    let intersect = |present: Vec<blake3::Hash>| -> HashSet<blake3::Hash> {
         present
             .into_iter()
             .filter(|h| chunks.contains_key(h))
@@ -66,11 +68,7 @@ pub(crate) fn remote_present(chunks: &HashMap<blake3::Hash, u64>) -> Result<Hash
             }
             present
         }
-        Remote::Opendal { store, rt } => rt.block_on(async {
-            anyhow::Ok(intersect(
-                store.list().await?.into_iter().map(|(h, _)| h).collect(),
-            ))
-        })?,
+        Remote::Opendal { store, rt } => intersect(rt.block_on(store.list_names())?),
         Remote::Ssh(mut ssh) => intersect(ssh.list()?.into_iter().map(|(h, _)| h).collect()),
     })
 }
@@ -104,15 +102,46 @@ fn sweep_decision(
     }
 }
 
+#[derive(Default)]
+struct SweepPlan {
+    delete: Vec<blake3::Hash>,
+    kept_live: usize,
+    kept_grace: usize,
+}
+
+impl SweepPlan {
+    fn new(
+        entries: Vec<(blake3::Hash, Option<SystemTime>)>,
+        live: &HashSet<blake3::Hash>,
+        grace: Duration,
+        now: SystemTime,
+    ) -> Self {
+        let mut plan = Self::default();
+        for (hash, modified) in entries {
+            match sweep_decision(live.contains(&hash), modified, grace, now) {
+                SweepAction::KeepLive => plan.kept_live += 1,
+                SweepAction::KeepGrace => plan.kept_grace += 1,
+                SweepAction::Delete => plan.delete.push(hash),
+            }
+        }
+        plan
+    }
+
+    fn report(&self, backend: &str, dry_run: bool) {
+        eprintln!(
+            "git-cdc: {backend} gc {} {} chunks ({} live, {} in grace period)",
+            if dry_run { "would remove" } else { "removed" },
+            self.delete.len(),
+            self.kept_live,
+            self.kept_grace,
+        );
+    }
+}
+
 pub fn cmd_push() -> Result<()> {
     let store = local_store()?;
 
-    let mut chunks: std::collections::HashMap<blake3::Hash, u64> = Default::default();
-    for m in all_manifests()? {
-        for c in &m.chunks {
-            chunks.insert(c.hash, c.length as u64);
-        }
-    }
+    let chunks = crate::history::collect()?;
     if chunks.is_empty() {
         eprintln!("git-cdc: no manifests found, nothing to push");
         return Ok(());
@@ -170,7 +199,7 @@ pub fn cmd_push() -> Result<()> {
         Remote::Opendal { store: remote_store, rt } => rt.block_on(async {
             // One paginated listing beats a HeadObject per chunk.
             let present: HashSet<blake3::Hash> =
-                remote_store.list().await?.into_iter().map(|(h, _)| h).collect();
+                remote_store.list_names().await?.into_iter().collect();
             let pending = pending_uploads(&chunks, &present);
             for hash in &pending {
                 let data = store.get_encoded(hash).with_context(|| {
@@ -231,16 +260,45 @@ pub(crate) fn fetch_legacy(chunks: &HashMap<blake3::Hash, u64>) -> Result<()> {
                             err.message
                         );
                     }
-                    let href = &obj
+                }
+                let download = |object: &ObjectResult| -> Result<()> {
+                    let action = object
                         .actions
                         .as_ref()
-                        .and_then(|a| a.download.as_ref())
-                        .with_context(|| format!("no download action for {}", obj.oid))?
-                        .href;
-                    let hash = git_cdc_core::manifest::parse_hash(&obj.oid)?;
-                    let data = client.download(href)?;
-                    store.put_encoded(&hash, &data)?; // decodes envelope, verifies hash
-                }
+                        .and_then(|actions| actions.download.as_ref())
+                        .with_context(|| format!("no download action for {}", object.oid))?;
+                    let hash = git_cdc_core::manifest::parse_hash(&object.oid)?;
+                    let data = client.download(&action.href)?;
+                    store.put_encoded(&hash, &data)
+                };
+                // A fixed worker pool bounds both active requests and chunk
+                // buffers while sharing the HTTP client's connection pool.
+                let pending = Mutex::new(resp.objects.iter());
+                let failed = AtomicBool::new(false);
+                std::thread::scope(|scope| {
+                    let workers: Vec<_> = (0..resp.objects.len().min(4))
+                        .map(|_| {
+                            scope.spawn(|| -> Result<()> {
+                                while !failed.load(Ordering::Relaxed) {
+                                    let Some(obj) = pending.lock().unwrap().next() else {
+                                        break;
+                                    };
+                                    if let Err(error) = download(obj) {
+                                        failed.store(true, Ordering::Relaxed);
+                                        return Err(error);
+                                    }
+                                }
+                                Ok(())
+                            })
+                        })
+                        .collect();
+                    for worker in workers {
+                        worker
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("HTTP download worker panicked"))??;
+                    }
+                    anyhow::Ok(())
+                })?;
             }
             Remote::Opendal {
                 store: remote_store,
@@ -317,46 +375,19 @@ pub fn cmd_gc(dry_run: bool, grace_secs: u64) -> Result<()> {
             rt,
         }) => {
             // Serverless: no server to own the sweep — the CLI's grace applies.
-            let (deleted, kept_live, kept_grace) = rt.block_on(async {
-                let (mut deleted, mut kept_live, mut kept_grace) = (0usize, 0usize, 0usize);
-                for (hash, modified) in remote_store.list().await? {
-                    match sweep_decision(live.contains(&hash), modified, grace, now) {
-                        SweepAction::KeepLive => kept_live += 1,
-                        SweepAction::KeepGrace => kept_grace += 1,
-                        SweepAction::Delete => {
-                            if !dry_run {
-                                remote_store.remove(&hash).await?;
-                            }
-                            deleted += 1;
-                        }
-                    }
-                }
-                anyhow::Ok((deleted, kept_live, kept_grace))
-            })?;
-            eprintln!(
-                "git-cdc: remote gc {} {deleted} chunks ({kept_live} live, {kept_grace} in grace period)",
-                if dry_run { "would remove" } else { "removed" },
-            );
+            let plan = SweepPlan::new(rt.block_on(remote_store.list())?, &live, grace, now);
+            if !dry_run {
+                rt.block_on(remote_store.remove_many(&plan.delete))?;
+            }
+            plan.report("remote", dry_run);
         }
         Ok(Remote::Ssh(mut ssh)) => {
             // Like the opendal remote: no server owns the sweep — CLI grace + remote mtimes.
-            let (mut deleted, mut kept_live, mut kept_grace) = (0usize, 0usize, 0usize);
-            for (hash, modified) in ssh.list()? {
-                match sweep_decision(live.contains(&hash), modified, grace, now) {
-                    SweepAction::KeepLive => kept_live += 1,
-                    SweepAction::KeepGrace => kept_grace += 1,
-                    SweepAction::Delete => {
-                        if !dry_run {
-                            ssh.remove(&hash)?;
-                        }
-                        deleted += 1;
-                    }
-                }
+            let plan = SweepPlan::new(ssh.list()?, &live, grace, now);
+            if !dry_run {
+                ssh.remove_many(&plan.delete)?;
             }
-            eprintln!(
-                "git-cdc: ssh gc {} {deleted} chunks ({kept_live} live, {kept_grace} in grace period)",
-                if dry_run { "would remove" } else { "removed" },
-            );
+            plan.report("ssh", dry_run);
         }
         Err(_) => eprintln!("git-cdc: no remote configured, skipped remote gc"),
     }

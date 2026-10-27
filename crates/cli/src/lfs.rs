@@ -14,6 +14,7 @@ use git_cdc_core::manifest::{Manifest, is_manifest};
 use sha2::{Digest, Sha256};
 
 use crate::git::{ChunkParamsFor, chunk_params, git_out, repo_root};
+use crate::manifest::{MAX_MANIFEST_SIZE, detect, read_candidate};
 
 pub(crate) mod cache;
 mod context;
@@ -26,7 +27,6 @@ pub use hooks::{dispatch_hook, install};
 
 const STORAGE: &str = "git-lfs-v1";
 const MAX_CHUNKS: usize = 65_536;
-const MAX_MANIFEST: u64 = 16 * 1024 * 1024;
 const LFS_POINTER_VERSION: &str = "version https://git-lfs.github.com/spec/v1";
 /// Bind Git LFS's named remote to this pre-push invocation's destination,
 /// retaining remote-specific LFS settings through command-local overrides.
@@ -118,15 +118,7 @@ fn chunk_oid<'a>(m: &'a Manifest, c: &Chunk) -> Result<&'a str> {
     Ok(oid)
 }
 
-fn parse(data: &[u8]) -> Result<Manifest> {
-    ensure!(
-        data.len() as u64 <= MAX_MANIFEST,
-        "LFS manifest exceeds 16 MiB"
-    );
-    validate_manifest(Manifest::parse(data)?)
-}
-
-fn validate_manifest(m: Manifest) -> Result<Manifest> {
+pub(crate) fn validate_manifest(m: Manifest) -> Result<Manifest> {
     ensure!(
         m.extra.get("storage").map(String::as_str) == Some(STORAGE),
         "not a standard-LFS git-cdc manifest; use its original filter/backend"
@@ -154,16 +146,6 @@ fn validate_manifest(m: Manifest) -> Result<Manifest> {
     }
     ensure!(offset == m.size, "LFS manifest size mismatch");
     Ok(m)
-}
-
-fn read_manifest(reader: impl Read) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    reader.take(MAX_MANIFEST + 1).read_to_end(&mut data)?;
-    ensure!(
-        data.len() as u64 <= MAX_MANIFEST,
-        "LFS manifest exceeds 16 MiB"
-    );
-    Ok(data)
 }
 
 /// Separate local LFS cache: stock `git lfs prune` cannot discover references
@@ -244,7 +226,7 @@ impl Store {
             File::open(&path)?
                 .take(bytes.len() as u64 + 1)
                 .read_to_end(&mut old)?;
-            if old.len() == bytes.len() && sha256(&old) == oid {
+            if old == bytes {
                 return Ok(oid);
             }
         }
@@ -333,22 +315,20 @@ impl Store {
 }
 
 pub(crate) fn clean(
-    mut reader: impl Read,
+    reader: impl Read,
     mut writer: impl Write,
     store: &Store,
     params: ChunkParams,
 ) -> Result<()> {
-    let mut head = Vec::new();
-    (&mut reader).take(64).read_to_end(&mut head)?;
-    if is_manifest(&head) {
-        let data = read_manifest(head.as_slice().chain(reader))?;
-        parse(&data)?; // reject conflict markers, malformed/foreign recipes
-        writer.write_all(&data)?;
+    let mut reader = BufReader::with_capacity(64, reader);
+    let (prefix, manifest) = read_candidate(&mut reader, true)?;
+    if manifest.is_some() {
+        writer.write_all(&prefix)?;
         return Ok(());
     }
     let mut refs = BTreeMap::new();
     let mut count = 0usize;
-    let (chunks, oid, size) = chunk_stream(head.as_slice().chain(reader), params, |c, bytes| {
+    let (chunks, oid, size) = chunk_stream(prefix.as_slice().chain(reader), params, |c, bytes| {
         count += 1;
         ensure!(
             count <= MAX_CHUNKS,
@@ -362,7 +342,7 @@ pub(crate) fn clean(
     m.extra = refs;
     let encoded = m.encode();
     ensure!(
-        encoded.len() as u64 <= MAX_MANIFEST,
+        encoded.len() as u64 <= MAX_MANIFEST_SIZE,
         "LFS manifest exceeds 16 MiB"
     );
     writer.write_all(encoded.as_bytes())?;
@@ -383,16 +363,14 @@ fn reassemble(m: &Manifest, store: &Store, mut writer: impl Write) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn smudge(mut reader: impl Read, mut writer: impl Write, store: &Store) -> Result<()> {
-    let mut head = Vec::new();
-    (&mut reader).take(64).read_to_end(&mut head)?;
-    if !is_manifest(&head) {
-        writer.write_all(&head)?;
+pub(crate) fn smudge(reader: impl Read, mut writer: impl Write, store: &Store) -> Result<()> {
+    let mut reader = BufReader::with_capacity(64, reader);
+    let (prefix, manifest) = read_candidate(&mut reader, true)?;
+    let Some(m) = manifest else {
+        writer.write_all(&prefix)?;
         io::copy(&mut reader, &mut writer)?;
         return Ok(());
-    }
-    let data = read_manifest(head.as_slice().chain(reader))?;
-    let m = parse(&data)?;
+    };
     // Callers spool this result until the whole file has passed verification.
     reassemble(&m, store, &mut writer)
 }
@@ -457,10 +435,15 @@ fn visit_manifests(
     visit_blobs_with(
         tips,
         excluded,
+        Some(MAX_MANIFEST_SIZE),
+        None,
         is_manifest,
         |body| {
-            let m = Manifest::parse(body)?;
-            if m.extra.contains_key("storage") {
+            if let Some(m) = detect(body)
+                && m.extra.contains_key("storage")
+            {
+                // A parsed recipe with broken references must block publication:
+                // skipping it could leave pushed history without its chunks.
                 visit(validate_manifest(m)?)?;
             }
             Ok(())
@@ -472,6 +455,8 @@ fn visit_manifests(
 fn visit_blobs_with(
     tips: &BTreeSet<String>,
     excluded: &BTreeSet<String>,
+    max_blob_size: Option<u64>,
+    paths: Option<&BTreeSet<String>>,
     matches: impl Fn(&[u8]) -> bool,
     mut visit: impl FnMut(&[u8]) -> Result<()>,
     mut command: impl FnMut() -> Command,
@@ -484,85 +469,122 @@ fn visit_blobs_with(
         writeln!(revisions, "^{tip}")?;
     }
     revisions.rewind()?;
-    let mut walk = command()
-        .args(["rev-list", "--objects", "--no-object-names", "--stdin"])
-        .stdin(Stdio::from(revisions))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let mut check = command()
-        .args(["cat-file", "--batch-check"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut check_in = BufWriter::new(check.stdin.take().unwrap());
-    let mut check_out = BufReader::new(check.stdout.take().unwrap());
-    let mut cat = command()
-        .args(["cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut cat_in = BufWriter::new(cat.stdin.take().unwrap());
-    let mut cat_out = BufReader::new(cat.stdout.take().unwrap());
-    let result = (|| {
-        for oid in BufReader::new(walk.stdout.take().unwrap()).lines() {
-            let oid = oid?;
-            writeln!(check_in, "{oid}")?;
-            check_in.flush()?;
-            let mut header = String::new();
-            check_out.read_line(&mut header)?;
-            let fields: Vec<_> = header.split_whitespace().collect();
-            ensure!(fields.len() == 3, "unreadable Git object {oid}: {header}");
-            let size: u64 = fields[2].parse()?;
-            if fields[1] != "blob" {
-                continue;
-            }
-            writeln!(cat_in, "{oid}")?;
-            cat_in.flush()?;
-            let mut header = String::new();
-            cat_out.read_line(&mut header)?;
-            ensure!(
-                header.split_whitespace().nth(2) == Some(fields[2]),
-                "Git object changed during scan"
-            );
-            let mut body = Vec::new();
-            (&mut cat_out).take(size.min(64)).read_to_end(&mut body)?;
-            let remaining = size - body.len() as u64;
-            let matched = matches(&body);
-            if matched {
-                ensure!(
-                    size <= MAX_MANIFEST,
-                    "oversized LFS metadata in pushed history"
-                );
-                (&mut cat_out).take(remaining).read_to_end(&mut body)?;
-            } else {
-                let drained = io::copy(&mut (&mut cat_out).take(remaining), &mut io::sink())?;
-                ensure!(drained == remaining, "truncated Git blob");
-            }
-            let mut lf = [0];
-            cat_out.read_exact(&mut lf)?;
-            ensure!(lf == *b"\n", "invalid cat-file response");
-            if matched {
-                visit(&body)?;
-            }
-        }
-        anyhow::Ok(())
-    })();
-    drop(check_in);
-    drop(cat_in);
-    // On error, terminate producers before waiting: rev-list may be blocked
-    // writing its pipe. No subprocess is left behind by a refused push.
-    if result.is_err() {
-        for child in [&mut walk, &mut cat, &mut check] {
-            let _ = child.kill();
-        }
+    let mut objects = BufWriter::new(tempfile::tempfile()?);
+    let mut walk_command = command();
+    walk_command.args(["rev-list", "--objects", "--stdin"]);
+    if paths.is_none() {
+        walk_command.arg("--no-object-names");
     }
-    let statuses = [walk.wait()?, check.wait()?, cat.wait()?];
+    with_git_output(
+        walk_command
+            .stdin(Stdio::from(revisions))
+            .stderr(Stdio::inherit()),
+        "Git history walk failed",
+        |output| {
+            for line in output.lines() {
+                let line = line?;
+                let (oid, path) = line.split_once(' ').unwrap_or((&line, ""));
+                if paths.is_none_or(|paths| paths.contains(path)) {
+                    writeln!(objects, "{oid}")?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    // Queue requests in files so Git can read ahead without either side
+    // filling a pipe. Each stage streams its output with bounded memory.
+    let mut objects = objects.into_inner()?;
+    objects.rewind()?;
+    let mut blobs = BufWriter::new(tempfile::tempfile()?);
+    with_git_output(
+        command()
+            .args(["cat-file", "--batch-check"])
+            .stdin(Stdio::from(objects)),
+        "Git object inspection failed",
+        |output| {
+            for header in output.lines() {
+                let header = header?;
+                let fields: Vec<_> = header.split_whitespace().collect();
+                ensure!(
+                    fields.len() == 3 && is_git_oid(fields[0]),
+                    "unreadable Git object: {header}"
+                );
+                let size: u64 = fields[2].parse()?;
+                if fields[1] != "blob" || max_blob_size.is_some_and(|limit| size > limit) {
+                    continue;
+                }
+                writeln!(blobs, "{}", fields[0])?;
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut blobs = blobs.into_inner()?;
+    blobs.rewind()?;
+    with_git_output(
+        command()
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::from(blobs)),
+        "Git history blob scan failed",
+        |output| {
+            loop {
+                let mut header = String::new();
+                if output.read_line(&mut header)? == 0 {
+                    break;
+                }
+                let fields: Vec<_> = header.split_whitespace().collect();
+                ensure!(
+                    fields.len() == 3 && is_git_oid(fields[0]) && fields[1] == "blob",
+                    "unreadable Git blob: {header}"
+                );
+                let size: u64 = fields[2].parse()?;
+                ensure!(
+                    max_blob_size.is_none_or(|limit| size <= limit),
+                    "Git object changed during scan"
+                );
+                let mut body = Vec::new();
+                output.by_ref().take(size.min(64)).read_to_end(&mut body)?;
+                let remaining = size - body.len() as u64;
+                let matched = matches(&body);
+                if matched {
+                    ensure!(
+                        size <= MAX_MANIFEST_SIZE,
+                        "oversized LFS metadata in pushed history"
+                    );
+                    output.by_ref().take(remaining).read_to_end(&mut body)?;
+                } else {
+                    let drained = io::copy(&mut output.by_ref().take(remaining), &mut io::sink())?;
+                    ensure!(drained == remaining, "truncated Git blob");
+                }
+                let mut lf = [0];
+                output.read_exact(&mut lf)?;
+                ensure!(lf == *b"\n", "invalid cat-file response");
+                if matched {
+                    visit(&body)?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Close the output before waiting, and stop Git if reading or visiting fails.
+fn with_git_output(
+    command: &mut Command,
+    failure: &str,
+    read: impl FnOnce(&mut BufReader<std::process::ChildStdout>) -> Result<()>,
+) -> Result<()> {
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let result = read(&mut output);
+    drop(output);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
     result?;
-    ensure!(
-        statuses.iter().all(|status| status.success()),
-        "Git history scan failed"
-    );
+    ensure!(status.success(), "{failure}");
     Ok(())
 }
 
@@ -665,6 +687,14 @@ pub fn textconv(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(data: &[u8]) -> Result<Manifest> {
+        ensure!(
+            data.len() as u64 <= MAX_MANIFEST_SIZE,
+            "LFS manifest exceeds 16 MiB"
+        );
+        validate_manifest(Manifest::parse(data)?)
+    }
 
     fn recipe() -> Manifest {
         let tmp = tempfile::tempdir().unwrap();

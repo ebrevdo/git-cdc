@@ -1,15 +1,15 @@
 //! A private Git repository carries one frozen download configuration. Git LFS
 //! still resolves endpoints, credentials and transfer adapters itself.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Store, git_out, lfs_pointer, repo_root};
+use super::{Store, git_out, repo_root, retention};
 
 pub(super) enum VerificationRisk {
     FileEndpoint,
@@ -290,6 +290,15 @@ impl DownloadContext {
                 destination,
                 false,
             )?;
+        } else if context.remote != "." {
+            // `lfs fetch` requires a named Git remote even when an explicit
+            // LFS URL supplies the endpoint. This stays private and is never
+            // treated as a destination for retention or eviction verification.
+            let repository = context
+                .path()
+                .to_str()
+                .context("non-UTF-8 private repository")?;
+            context.configure(&format!("remote.{}.url", context.remote), repository, false)?;
         }
         for (key, value) in [
             ("branch.cdc-cache-probe.remote", context.remote.as_str()),
@@ -376,6 +385,29 @@ impl DownloadContext {
         )
     }
 
+    pub fn share_source_objects(&self) -> Result<()> {
+        // Git's retention checks can reuse the clone's metadata, including a
+        // linked worktree's shared store. Keep download recipes self-contained:
+        // stock LFS versions differ in their handling of quoted alternates.
+        let objects = git_out(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ])?;
+        let quoted = objects
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        fs::write(
+            self.path().join(".git/objects/info/alternates"),
+            format!("\"{quoted}\"\n"),
+        )?;
+        Ok(())
+    }
+
     pub fn command(&self) -> Command {
         let mut command = private_command(self.path());
         command
@@ -428,35 +460,41 @@ impl DownloadContext {
         Ok(())
     }
 
-    pub fn download(&self, oid: &str, size: u64) -> Result<Vec<u8>> {
-        let mut child = self
+    pub fn download_batch(
+        &self,
+        objects: &[(String, u64)],
+        mut store: impl FnMut(&str, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let pointers: BTreeMap<_, _> = objects.iter().cloned().collect();
+        // The temporary commit has no parents or published refs. HEAD stays
+        // empty so these download recipes cannot affect eviction verification.
+        let commit = retention::stage_with(&pointers, &[], self.command())?;
+        let status = self
             .command()
-            .args(["lfs", "smudge"])
-            .stdin(Stdio::piped())
+            .args(["lfs", "fetch", "--all", &self.remote, &commit])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn()?;
-        let sent = child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(lfs_pointer(oid, size).as_bytes());
-        let status = child.wait()?;
-        sent?;
-        ensure!(status.success(), "LFS download failed for {oid}");
+            .status()?;
+        ensure!(status.success(), "LFS batch download failed");
         let downloaded = self.store();
-        let bytes = downloaded.read_cached_leased(oid, size)?;
-        fs::remove_file(downloaded.path(oid))?;
-        Ok(bytes)
+        for (oid, size) in objects {
+            let bytes = downloaded.read_cached_leased(oid, *size)?;
+            store(oid, bytes)?;
+            fs::remove_file(downloaded.path(oid))?;
+        }
+        Ok(())
     }
 
     /// The private HEAD has no LFS pointers, so every placeholder is prunable.
     /// Verification runs on this disposable cache, never the user's cache.
     pub fn verify_remote(&self, objects: &[(String, u64)]) -> Result<HashSet<String>> {
+        // A failure conservatively keeps this entire group. Bound the group
+        // while amortizing stock Git LFS startup and verification requests.
+        const BATCH_OBJECTS: usize = 1024;
         let mut verified = HashSet::new();
         let store = self.store();
         let objects_path = store.root.join("objects");
-        for batch in objects.chunks(128) {
+        for batch in objects.chunks(BATCH_OBJECTS) {
             match fs::remove_dir_all(&objects_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}

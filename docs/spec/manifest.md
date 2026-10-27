@@ -32,12 +32,21 @@ chunk blake3:0a1b2c... 2097152 1835008
 
 ## Detection
 
-A blob is treated as a manifest iff its first line is exactly
-`version git-cdc/spec/v1` (byte-for-byte, terminated by `\n`). Anything
-else is passed through untouched by the filters — this is the safety
-property that makes fresh clones and mixed repos work. The version value is
-an opaque format tag, not a URL; it changes only on incompatible format
-revisions.
+A blob is a manifest iff it fully parses as this format. The first line,
+`version git-cdc/spec/v1` (byte-for-byte, terminated by `\n`), is only a
+cheap candidate check. Content with that prefix that fails to parse, or
+exceeds the 16 MiB manifest size cap, is ordinary data: clean chunks it,
+smudge passes it through, and history scans skip it.
+
+Clean passes a complete, valid manifest for its backend through byte-for-byte,
+so re-adding a file whose content has not been downloaded preserves its recipe.
+Once a blob parses, it remains a recipe: an unknown storage backend, damaged
+backend metadata, or a filter/backend mismatch is an error, never ordinary
+content. History scans also fail on parsed recipes with damaged backend metadata
+to avoid publishing history whose chunks have not been uploaded.
+
+The version value is an opaque format tag, not a URL; it changes only on
+incompatible format revisions.
 
 ## Header
 

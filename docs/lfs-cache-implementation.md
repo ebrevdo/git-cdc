@@ -62,6 +62,10 @@ retention metadata works with both SHA-1 and SHA-256 Git repositories. It
 contains one empty commit, without source branches, stashes or worktrees.
 It is initialized on demand, reused across batches, and
 removed automatically when the command finishes. This is an init, not a clone.
+For retention verification, its Git object store reads the source clone's
+objects through an alternate, including the shared store of a linked worktree.
+New metadata stays private. Download contexts keep self-contained Git objects
+for compatibility with stock LFS readers of alternate paths.
 
 ## Read-only backing verification
 
@@ -73,8 +77,15 @@ An object is eligible for eviction only when both checks succeed:
    roots and remote-tracking refs are not sufficient.
 2. Stock Git LFS verifies the object at the corresponding download endpoint.
 
+All advertised retention refs are fetched in one request using stdin. A
+streaming `rev-list --objects` walk filters canonical pointer paths against
+the eviction candidates before inspecting blob contents and sizes. Object
+inspection uses file-backed `cat-file` batches, without a round trip for each
+object. The walk still traverses retention history, but unrelated pointer
+blobs are never read by this check.
+
 The second check uses a disposable cache under the private Git directory.
-For each batch of at most 128 objects, the adapter clears that cache, creates
+For each batch of at most 1,024 objects, the adapter clears that cache, creates
 sparse placeholder files with exactly the candidate SHA-256 names and sizes,
 and runs:
 

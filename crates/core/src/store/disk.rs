@@ -68,6 +68,9 @@ impl ChunkStore for DiskStore {
         if blake3::hash(data) != *hash {
             bail!("chunk data does not match hash {}", hash.to_hex());
         }
+        if self.has(hash) {
+            return Ok(());
+        }
         self.write_object(hash, &super::envelope::encode(data))
     }
 
@@ -139,6 +142,9 @@ mod tests {
         let hash = blake3::hash(b"expected content");
         assert!(s.put(&hash, b"different content").is_err());
         assert!(!s.has(&hash));
+        s.put(&hash, b"expected content").unwrap();
+        assert!(s.put(&hash, b"different content").is_err());
+        assert_eq!(s.get(&hash).unwrap(), b"expected content");
     }
 
     #[test]

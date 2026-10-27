@@ -23,6 +23,16 @@ Service credentials are **never** git config — they come from each
 service's standard chain (e.g. for S3: `AWS_ACCESS_KEY_ID`/
 `AWS_SECRET_ACCESS_KEY` env vars, `~/.aws` profiles, or instance metadata).
 
+## LFS backend
+
+The [Git LFS backend](lfs.md) takes its endpoint and credentials from Git LFS
+configuration. Its git-cdc settings:
+
+| Key | Meaning |
+| --- | ------- |
+| `cdc.storage` | Set to `lfs` by `git cdc install --lfs`, so plain `git cdc track` uses the LFS backend |
+| `cdc.lfs.transferBatchBytes` | Most missing chunk data a push downloads per batch when chunks aren't cached locally (default `64m`; `k`/`m`/`g` suffixes work) |
+
 ## Filter registration
 
 Written by `git cdc install`:
@@ -49,7 +59,7 @@ FastCDC bounds are configurable per repo (defaults 512 KiB / 2 MiB /
 git config cdc.chunk.min 64k    # 64 B – 1 MiB
 git config cdc.chunk.avg 256k   # 256 B – 4 MiB
 git config cdc.chunk.max 1m     # 1 KiB – 16 MiB   (min ≤ avg ≤ max)
-
+```
 
 ### `cdc.chunk.*` across a team
 

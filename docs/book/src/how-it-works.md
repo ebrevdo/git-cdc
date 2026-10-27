@@ -97,16 +97,29 @@ lives in the [Manifest Format Spec](spec.md).
 
 ## Sync
 
-**push** walks *all* of history (`git rev-list --all --objects`), sniffs
-out every manifest blob by its fixed first line, collects the referenced
-chunk set, asks the remote which chunks it's missing (one batch call, or
-one S3 listing), and uploads only those. The pre-push hook runs this
-automatically, so manifests never reach the git remote ahead of their
-chunks.
+**push** collects recipes from *all* reachable history, checks
+candidate blobs by their size, fixed first line and full manifest parse, collects
+the referenced chunk set, asks the remote which chunks it's missing (one
+batch call, or one S3 listing), and uploads only those. The pre-push hook runs
+this automatically, so manifests never reach the git remote ahead of their chunks.
+
+Push caches validated chunk metadata and scans only new history when refs
+advance. Missing or corrupt metadata triggers a complete scan. Every push
+still checks which chunks its destination needs. History scans skip oversized
+blobs without reading their contents, and prune shares reads across its
+protection checks. Push leaves the cache file untouched when its history roots
+are unchanged.
 
 **pull** does the reverse for the *current checkout*: fetch missing chunks
 into the local store, then materialize any tracked file whose worktree
 still holds manifest text.
+
+Pull batches index and attribute lookups, and fetches chunks only for files
+that need materializing. Existing content and local edits are left untouched.
+Verified files replace their recipes atomically, with one index refresh for
+the operation. Pull does not force worktree fsyncs; drop keeps its durability
+checks before evicting chunks.
+SIGINT and SIGTERM release the index lock before exiting.
 
 Branches need no special handling: the chunk store is branch-agnostic, and
 push/gc walk every ref. Identical content on two branches is stored once.

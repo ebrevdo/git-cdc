@@ -80,3 +80,99 @@ pub fn base_setup_repo(repo: &Path) {
         ],
     );
 }
+
+/// Run Git subprocesses through a test wrapper while preserving the caller's
+/// configured PATH and forwarding ordinary commands to the real executable.
+#[cfg(unix)]
+pub fn wrap_git(command: &mut Command, directory: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+        .unwrap_or_else(|| std::env::var_os("PATH").unwrap());
+    let real_git = std::env::split_paths(&path)
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let wrapper_dir = directory.join("git-wrapper");
+    std::fs::create_dir_all(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    std::fs::write(&wrapper, script).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    command
+        .env(
+            "PATH",
+            std::env::join_paths(std::iter::once(wrapper_dir).chain(std::env::split_paths(&path)))
+                .unwrap(),
+        )
+        .env("CDC_TEST_REAL_GIT", real_git);
+}
+
+/// Record content requests, independently of size/type checks. This verifies
+/// history scans avoid reading skipped blobs without measuring elapsed time.
+#[cfg(unix)]
+pub fn record_blob_requests(
+    command: &mut Command,
+    directory: &Path,
+) -> (std::process::Output, Vec<String>) {
+    wrap_git(
+        command,
+        directory,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    if [ "$CDC_TEST_BATCH_FILES_REQUIRED" = 1 ] && { [ "$arg" = --batch ] || [ "$arg" = --batch-check ]; } && [ -p /dev/stdin ]; then
+        echo 'Git object requests must be queued before reading responses' >&2
+        exit 91
+    fi
+    if [ "$arg" = --batch ]; then
+        tee -a "$CDC_TEST_REQUESTS" | "$CDC_TEST_REAL_GIT" "$@"
+        exit $?
+    fi
+done
+exec "$CDC_TEST_REAL_GIT" "$@"
+"#,
+    );
+    let requests = directory.join("blob-requests");
+    let _ = std::fs::remove_file(&requests);
+    let output = command
+        .env("CDC_TEST_REQUESTS", &requests)
+        .output()
+        .unwrap();
+    let requests = std::fs::read_to_string(requests)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (output, requests)
+}
+
+pub fn traced_git_commands(path: &Path) -> Vec<Vec<String>> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            (event["event"] == "start").then(|| {
+                event["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_owned())
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+pub fn cache_write_marker(path: &Path) -> std::time::SystemTime {
+    // A fixed old timestamp detects replacement without measuring elapsed time.
+    let marker = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(marker))
+        .unwrap();
+    marker
+}

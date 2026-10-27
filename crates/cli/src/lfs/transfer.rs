@@ -5,15 +5,35 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 use super::{PushRemote, Store, git_out, lfs_pointer, repo_root, retention};
 
-const BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const BATCH_OBJECTS: usize = 128;
+
+fn batch_bytes() -> Result<u64> {
+    let key = "cdc.lfs.transferBatchBytes";
+    let out = Command::new("git")
+        .args(["config", "--type=int", "--get", key])
+        .output()?;
+    if out.status.code() == Some(1) {
+        return Ok(64 * 1024 * 1024);
+    }
+    ensure!(
+        out.status.success(),
+        "cannot read {key}: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let bytes = String::from_utf8(out.stdout)?
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be a positive byte size"))?;
+    ensure!(bytes > 0, "{key} must be a positive byte size");
+    Ok(bytes)
+}
 
 pub(super) struct Object {
     pub size: u64,
@@ -55,6 +75,7 @@ pub(super) fn publish(
     let mut session = TransferSession {
         store,
         target,
+        batch_bytes: batch_bytes()?,
         file: FileUpload::start(store, target)?,
         publication: retention::Publication::new(target)?,
         pending: BTreeMap::new(),
@@ -79,6 +100,7 @@ pub(super) fn publish(
 struct TransferSession<'a> {
     store: &'a Store,
     target: &'a PushRemote,
+    batch_bytes: u64,
     file: Option<FileUpload>,
     publication: retention::Publication<'a>,
     pending: BTreeMap<String, u64>,
@@ -108,7 +130,7 @@ impl TransferSession<'_> {
             started,
             format_args!("{} objects", batch.len()),
         );
-        if missing_bytes > BATCH_BYTES && batch.len() > 1 {
+        if missing_bytes > self.batch_bytes && batch.len() > 1 {
             // Cold history often already exists remotely. Negotiate metadata
             // first, keeping credentials in one client for up to 128 objects.
             // Only failed negotiations need smaller recovery batches.

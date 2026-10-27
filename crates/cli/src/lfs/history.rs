@@ -118,6 +118,9 @@ pub(super) fn collect(tips: &BTreeSet<String>) -> Result<BTreeMap<String, Object
         Some(previous) if previous.covers_only_ancestors_of(tips)? => Some(previous),
         _ => None,
     };
+    let unchanged = previous
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.tips == *tips);
     let (excluded, mut objects) = previous
         .map(|snapshot| (snapshot.tips, snapshot.objects))
         .unwrap_or_default();
@@ -139,7 +142,7 @@ pub(super) fn collect(tips: &BTreeSet<String>) -> Result<BTreeMap<String, Object
     };
     // Cache loss, concurrent writers, or an unwritable cache never establishes
     // remote presence and must not prevent a correctly verified publication.
-    if let Err(error) = snapshot.write(&path) {
+    if !unchanged && let Err(error) = snapshot.write(&path) {
         trace(
             "history cache",
             started,
