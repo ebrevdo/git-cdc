@@ -41,6 +41,15 @@ per push; each checkpoint extends the preceding publication.
 Only then does the pre-push hook allow Git to publish the user's ref updates.
 There is no additional server, repository, or tracked sidecar. User history is unchanged.
 
+Ordinary pushes negotiate chunks only from recipes new to the destination's
+branches and tags, plus the old values of refs being updated. Provider-managed
+review refs do not establish coverage: commits imported from a fork may not
+have their chunks in this destination's LFS storage. Earlier successful pushes
+cover the excluded history. With no new chunks and all remote roots reachable
+from local retention refs, the hook publishes no root.
+`git -c cdc.lfs.fullPush=true push origin main` opts into checking and pinning
+the whole pushed history again after a bypass, endpoint move, or data loss.
+
 Previous remote retention roots become ancestors of the new root. Parent lists
 are reduced to their independent tips using Git's graph operations. Git
 fast-import creates the standard pointer blobs, tree and commit in one process;
@@ -54,6 +63,12 @@ pre-push, and deletion-only mirror operations can provide no pushed tips to the
 hook. The fresh root is outside the already-negotiated deletion list, while its
 ancestry keeps the older pointer roots reachable. This protects chunks even
 when an ordinary clone mirrors refs without having fetched the retention refs.
+Because the hook cannot reliably distinguish such deletions, it preserves
+remote roots whenever they are unreachable from local retention refs. One
+ancestry walk checks all roots. A fresh preservation root is also a local ref,
+so subsequent ordinary pushes skip publication until another publisher adds
+an uncovered root. A mirror preserves pointers through the local descendant
+even when it deletes the older roots' individual refs.
 
 A user's pre-push veto runs before storage preparation. The internal storage
 push uses `--no-verify` to avoid recursively executing the same client gate;
@@ -87,12 +102,15 @@ standard standalone-file transfer adapter:
   within its byte budget and evicts fetched chunks after pinning, while retaining
   a pre-existing cache object.
 - An 80 MiB push with cached chunks performs one retention discovery and one
-  retention push, measured through Git Trace2 events. Its next push reuses
-  ancestry metadata with the chunk cache empty; the HTTP path negotiates the
-  already-present objects in one LFS client invocation.
+  retention push, measured through Git Trace2 events. Its next ordinary-file
+  push with the chunk cache empty runs no CDC LFS transfer, fast-import, or
+  retention push. Warm uploads use one LFS client per group of at most 512
+  objects, combining several server requests without unbounded open leases.
 - Metadata-cache corruption and unrelated branches trigger a full scan. A
-  cached history still fails publication when a required chunk is missing both
-  locally and remotely.
+  full check of cached history still fails publication when a required chunk
+  is missing both locally and remotely. Incremental checks intentionally skip
+  damage to previously published history; an opt-in full push repairs it when
+  source bytes remain available, even without a new user commit.
 
 The collector is explicitly a local simulation using stock pointer discovery.
 A live GitLab deployment and its administrative cleanup job were not run.

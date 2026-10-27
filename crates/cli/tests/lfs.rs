@@ -731,7 +731,7 @@ fn version_prefixed_content_is_chunked_and_old_raw_blobs_smudge_unchanged() {
             assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
             f.cdc(&f.repo, &["drop", "--all"]);
             assert_eq!(fs::read(f.repo.join("asset.bin")).unwrap(), data);
-            f.git(&f.repo, &["add", "asset.bin"]);
+            f.git(&f.repo, &["add", "--renormalize", "asset.bin"]);
         }
         f.commit("rechunked content");
         f.push();
@@ -2358,6 +2358,7 @@ fn cold_cache_push_recovers_from_target_despite_origin_tracking() {
     );
     f.git(&f.repo, &["push", "backup", "main"]);
     fs::remove_dir_all(&f.content).unwrap();
+    f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
     for target in ["backup", backup.to_str().unwrap()] {
         f.write("note.txt", target.as_bytes());
         f.git(&f.repo, &["add", "note.txt"]);
@@ -2385,7 +2386,7 @@ fn cold_cache_push_recovers_from_target_despite_origin_tracking() {
 }
 
 #[test]
-fn warm_push_combines_retention_and_reuses_history_metadata() {
+fn warm_push_combines_retention_and_skips_published_recipes() {
     let f = Fixture::new();
     f.git(&f.repo, &["config", "cdc.chunk.min", "1m"]);
     f.git(&f.repo, &["config", "cdc.chunk.avg", "4m"]);
@@ -2409,15 +2410,13 @@ fn warm_push_combines_retention_and_reuses_history_metadata() {
     );
     let roots = f.refs(&f.remote, RETENTION_PREFIX);
     let commands = traced_git_commands(&trace);
-    let discoveries = commands
+    let discovery_commands: Vec<_> = commands
         .iter()
         .filter(|args| {
-            args.iter().any(|arg| arg == "ls-remote")
-                && args
-                    .iter()
-                    .any(|arg| arg == &format!("{RETENTION_PREFIX}/*"))
+            args.iter().any(|arg| arg == "ls-remote") && args.iter().any(|arg| arg == "--refs")
         })
-        .count();
+        .collect();
+    let discoveries = discovery_commands.len();
     let publications = commands
         .iter()
         .filter(|args| {
@@ -2437,13 +2436,28 @@ fn warm_push_combines_retention_and_reuses_history_metadata() {
         "warm batches must publish one combined root"
     );
     assert_eq!(discoveries, 1, "retention roots must be discovered once");
+    let discovery = discovery_commands[0];
+    let start = discovery.iter().position(|arg| arg == "ls-remote").unwrap();
+    assert_eq!(
+        &discovery[start..],
+        [
+            "ls-remote",
+            "--refs",
+            "--",
+            f.remote.to_str().unwrap(),
+            "refs/heads/*",
+            "refs/tags/*",
+            &format!("{RETENTION_PREFIX}/*"),
+        ],
+        "discovery must request only branches, tags, and retention refs"
+    );
     assert_eq!(publications, 1, "retention must use one Git push");
-    let chunks = f.objects().len();
     f.write("note.txt", b"metadata-only update\n");
     f.git(&f.repo, &["add", "note.txt"]);
     f.commit("reuse complete ancestry metadata");
     fs::remove_dir_all(f.repo.join(".git/cdc/lfs/objects")).unwrap();
     let trace = f.temp.path().join("cold-push-trace.jsonl");
+    let started = Instant::now();
     let out = f
         .command(&f.repo, "git")
         .env("GIT_CDC_TRACE", "1")
@@ -2451,28 +2465,29 @@ fn warm_push_combines_retention_and_reuses_history_metadata() {
         .args(["push", "origin", "main"])
         .output()
         .unwrap();
+    println!(
+        "PERF ordinary_file_push_ms={}",
+        started.elapsed().as_millis()
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!("{chunks} reused, 1 excluded tips")),
-        "{stderr}"
-    );
+    assert!(stderr.contains("0 chunks from new recipes"), "{stderr}");
     println!("{stderr}");
-    if f.endpoint.is_some() {
-        let transfers = traced_git_commands(&trace)
-            .iter()
-            .filter(|args| args.windows(2).any(|pair| pair == ["lfs", "push"]))
-            .count();
-        assert_eq!(
-            transfers, 1,
-            "cold existing history needs one metadata negotiation"
-        );
-    }
-    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 2);
+    let commands = traced_git_commands(&trace);
+    assert!(
+        !commands.iter().any(|args| {
+            args.windows(2).any(|pair| pair == ["lfs", "push"])
+                || args
+                    .iter()
+                    .any(|arg| arg == "fast-import" || arg == "--no-verify")
+        }),
+        "ordinary-file pushes need no CDC transfer or retention preparation"
+    );
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX), roots);
     let clone = f.clone_repo("combined-retention");
     assert_eq!(fs::read(clone.join("a.bin")).unwrap(), data);
 }
@@ -2484,11 +2499,652 @@ fn warm_push_combines_multiple_object_batches() {
     f.git(&f.repo, &["config", "cdc.chunk.avg", "32k"]);
     f.git(&f.repo, &["config", "cdc.chunk.max", "64k"]);
     let data = test_data(12 * 1024 * 1024, 463);
-    f.publish_file("a.bin", &data, "more than 128 distinct chunks");
+    f.write("a.bin", &data);
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("more than 128 distinct chunks");
+    let trace = f.temp.path().join("many-object-upload.jsonl");
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if f.endpoint.is_some() {
+        assert_eq!(
+            traced_git_commands(&trace)
+                .iter()
+                .filter(|args| { args.windows(2).any(|pair| pair == ["lfs", "push"]) })
+                .count(),
+            1,
+            "warm content must use one stock LFS client"
+        );
+    }
     assert!(f.objects().len() > 128, "exercise several transfer batches");
+    assert!(f.objects().len() <= 512, "exercise one bounded warm group");
     assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 1);
     let clone = f.clone_repo("multiple-warm-batches");
     assert_eq!(fs::read(clone.join("a.bin")).unwrap(), data);
+}
+
+#[test]
+#[cfg(unix)]
+fn warm_full_push_bounds_leases_before_the_descriptor_limit() {
+    let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.chunk.min", "4k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.avg", "8k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.max", "16k"]);
+    f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
+    let data = test_data(12 * 1024 * 1024, 469);
+    f.write("a.bin", &data);
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("full history larger than the descriptor limit");
+    let chunks = objects_at(&f.repo.join(".git/cdc/lfs/objects")).len();
+    assert!(chunks > 1024, "exercise several bounded warm groups");
+    let trace = f.temp.path().join("bounded-warm-upload.jsonl");
+    let out = f.command(&f.repo, "python3")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .env("GIT_CDC_TRACE", "1")
+        .args(["-c", "import os,resource; resource.setrlimit(resource.RLIMIT_NOFILE,(1024,1024)); os.execvp('git',['git','push','origin','main'])"])
+        .output().unwrap();
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{report}");
+    let batches: Vec<usize> = report
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("git-cdc: LFS transfer: ")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert_eq!(batches.len(), chunks.div_ceil(512), "{report}");
+    assert_eq!(batches[0], 512, "must not fall back to 128-object batches");
+    assert!(batches.iter().all(|count| *count <= 512));
+    assert_eq!(batches.iter().sum::<usize>(), chunks);
+    if f.endpoint.is_some() {
+        assert_eq!(
+            traced_git_commands(&trace)
+                .iter()
+                .filter(|args| { args.windows(2).any(|pair| pair == ["lfs", "push"]) })
+                .count(),
+            batches.len(),
+            "one stock client per bounded warm group"
+        );
+    }
+    assert_eq!(f.objects().len(), chunks);
+    assert_eq!(stock_lfs_roots(&f).len(), chunks);
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn warm_push_falls_back_to_bounded_leases_under_low_descriptor_limits() {
+    let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.chunk.min", "16k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.avg", "32k"]);
+    f.git(&f.repo, &["config", "cdc.chunk.max", "64k"]);
+    let data = test_data(8 * 1024 * 1024, 467);
+    f.write("a.bin", &data);
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("warm history under a small descriptor limit");
+    assert!(objects_at(&f.repo.join(".git/cdc/lfs/objects")).len() > 192);
+    let out = f.command(&f.repo, "python3")
+        .args(["-c", "import os,resource; resource.setrlimit(resource.RLIMIT_NOFILE,(192,192)); os.execvp('git',['git','push','origin','main'])"])
+        .output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let clone = f.clone_repo("bounded-leases");
+    assert_eq!(fs::read(clone.join("a.bin")).unwrap(), data);
+}
+
+#[test]
+fn incremental_push_pins_only_chunks_from_new_recipes_and_full_push_repairs_old_data() {
+    let f = Fixture::new();
+    f.publish_file("a.bin", b"old content\n", "published history");
+    let original = f.objects();
+    for path in original.keys() {
+        fs::remove_file(path).unwrap();
+    }
+    f.write("a.bin", b"new content\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("one new recipe");
+    f.push();
+    assert_eq!(f.objects().len(), 1, "only the new recipe is negotiated");
+    let current = f.manifest("HEAD:a.bin");
+    let pins = f.refs(&f.remote, RETENTION_PREFIX);
+    assert_eq!(pins.len(), 2);
+    let newest = pins
+        .iter()
+        .find(|reference| {
+            f.git(
+                &f.remote,
+                &["show", &format!("{reference}:{}", ".gitattributes")],
+            )
+            .contains("filter=lfs")
+                && f.git(&f.remote, &["lfs", "ls-files", "--long", reference])
+                    .contains(&current.extra[&format!("lfs.{}", current.chunks[0].hash.to_hex())])
+        })
+        .unwrap();
+    assert_eq!(
+        f.git(&f.remote, &["lfs", "ls-files", "--long", newest])
+            .lines()
+            .count(),
+        1
+    );
+
+    // No dummy commit is needed: the opt-in check also runs when Git supplies
+    // an empty update list for an up-to-date push.
+    f.git(
+        &f.repo,
+        &["-c", "cdc.lfs.fullPush=true", "push", "origin", "main"],
+    );
+    assert_eq!(f.objects().len(), 2);
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 3);
+    assert!(
+        f.run(&f.repo, &["config", "--get", "cdc.lfs.fullPush"])
+            .stdout
+            .is_empty()
+    );
+}
+
+#[test]
+fn incremental_push_uses_other_destination_refs_including_annotated_tags() {
+    let f = Fixture::new();
+    f.publish_file(
+        "a.bin",
+        b"shared through a destination tag\n",
+        "shared history",
+    );
+    let pins = f.refs(&f.remote, RETENTION_PREFIX);
+    f.git(
+        &f.repo,
+        &["tag", "-a", "baseline", "-m", "shared destination history"],
+    );
+    f.git(&f.repo, &["push", "origin", "refs/tags/baseline"]);
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX), pins);
+    f.git(&f.remote, &["update-ref", "-d", "refs/heads/main"]);
+    f.write("note.md", b"a new branch from shared history\n");
+    f.git(&f.repo, &["add", "note.md"]);
+    f.commit("new branch, same recipe");
+    fs::remove_dir_all(f.repo.join(".git/cdc/lfs")).unwrap();
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_CDC_TRACE", "1")
+        .args(["push", "origin", "HEAD:refs/heads/new-branch"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0 chunks from new recipes"));
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX), pins);
+    assert!(objects_at(&f.repo.join(".git/cdc/lfs/objects")).is_empty());
+}
+
+#[test]
+fn incremental_push_checks_chunks_from_host_managed_refs() {
+    host_managed_refs_do_not_establish_chunk_publication(true);
+}
+
+#[test]
+fn incremental_push_blocks_missing_chunks_from_host_managed_refs() {
+    host_managed_refs_do_not_establish_chunk_publication(false);
+}
+
+fn host_managed_refs_do_not_establish_chunk_publication(cache_available: bool) {
+    for reference in [
+        "refs/pull/1/head",
+        "refs/pull/1/merge",
+        "refs/merge-requests/1/head",
+        "refs/merge-requests/1/merge",
+        "refs/keep-around/1111111111111111111111111111111111111111",
+        "refs/changes/01/1/1",
+    ] {
+        let f = Fixture::new();
+        let base = f.commit("published base without chunks");
+        f.push();
+        let contributor = f.clone_repo("contributor");
+        let data = format!("unpublished contributor content for {reference}\n");
+        fs::write(contributor.join("review.bin"), &data).unwrap();
+        f.git(&contributor, &["add", "review.bin"]);
+        f.git(&contributor, &["commit", "-qm", "contributor change"]);
+        // Model a host importing Git objects from a fork without transferring
+        // its CDC chunks into the destination's LFS storage.
+        f.git(
+            &contributor,
+            &[
+                "push",
+                "--no-verify",
+                "origin",
+                &format!("HEAD:{reference}"),
+            ],
+        );
+        f.git(&f.repo, &["fetch", "origin", reference]);
+        f.git(&f.repo, &["config", "cdc.hydrate", "false"]);
+        f.git(
+            &f.repo,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge contributor change",
+                "FETCH_HEAD",
+            ],
+        );
+        if cache_available {
+            f.write("review.bin", data.as_bytes());
+            f.git(&f.repo, &["add", "--renormalize", "review.bin"]);
+        }
+        assert!(f.objects().is_empty());
+        let out = f.run(&f.repo, &["push", "origin", "main"]);
+        let report = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.success(),
+            cache_available,
+            "{reference}: {report}"
+        );
+        if cache_available {
+            assert_eq!(f.objects().len(), 1, "{reference}");
+            assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 1);
+            let recovered = f.clone_repo("merged-review");
+            assert_eq!(
+                fs::read(recovered.join("review.bin")).unwrap(),
+                data.as_bytes()
+            );
+        } else {
+            assert!(
+                report.contains("LFS download failed"),
+                "{reference}: {report}"
+            );
+            assert_eq!(f.git(&f.remote, &["rev-parse", "main"]).trim(), base);
+            assert!(f.refs(&f.remote, RETENTION_PREFIX).is_empty());
+        }
+    }
+}
+
+#[test]
+fn incremental_push_excludes_supplied_old_values_of_custom_refs() {
+    let f = Fixture::new();
+    f.commit("published base without chunks");
+    f.push();
+    f.write("a.bin", b"published through a custom destination ref\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    f.commit("first custom ref publication");
+    f.git(&f.repo, &["push", "origin", "HEAD:refs/custom/topic"]);
+    let pins = f.refs(&f.remote, RETENTION_PREFIX);
+    f.write("note.md", b"ordinary update to a custom ref\n");
+    f.git(&f.repo, &["add", "note.md"]);
+    f.commit("incremental custom ref update");
+    fs::remove_dir_all(f.repo.join(".git/cdc/lfs")).unwrap();
+    let out = f
+        .command(&f.repo, "git")
+        .env("GIT_CDC_TRACE", "1")
+        .args(["push", "origin", "HEAD:refs/custom/topic"])
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{report}");
+    assert!(report.contains("0 chunks from new recipes"), "{report}");
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX), pins);
+    assert!(objects_at(&f.repo.join(".git/cdc/lfs/objects")).is_empty());
+}
+
+#[test]
+fn incremental_push_reuses_retention_ancestry_across_clones_and_mirrors() {
+    let f = Fixture::new();
+    f.publish_file("a.bin", b"original clone content\n", "original publication");
+    let peer = f.clone_repo("peer");
+    fs::write(peer.join("b.bin"), b"other clone content\n").unwrap();
+    f.git(&peer, &["add", "b.bin"]);
+    f.git(&peer, &["commit", "-qm", "peer publication"]);
+    f.git(&peer, &["push", "origin", "main"]);
+    let peer_pin = f.refs(&peer, RETENTION_PREFIX);
+    assert_eq!(peer_pin.len(), 1);
+    let peer_oid = f.git(&peer, &["rev-parse", &peer_pin[0]]);
+    assert!(!f.refs(&f.repo, RETENTION_PREFIX).contains(&peer_pin[0]));
+    f.git(&f.repo, &["pull", "--ff-only"]);
+    f.write("note.md", b"first ordinary push after peer publication\n");
+    f.git(&f.repo, &["add", "note.md"]);
+    f.commit("join retention ancestry once");
+    f.push();
+    let pins = f.refs(&f.remote, RETENTION_PREFIX);
+    assert_eq!(pins.len(), 3, "an uncovered peer root requires one guard");
+    let local_pins = f.refs(&f.repo, RETENTION_PREFIX);
+    assert!(
+        !local_pins.contains(&peer_pin[0]),
+        "the peer root was fetched as an object only"
+    );
+
+    for i in 0..3 {
+        f.write("note.md", format!("ordinary follow-up {i}\n").as_bytes());
+        f.git(&f.repo, &["add", "note.md"]);
+        f.commit("reuse retention ancestry");
+        let trace = f.temp.path().join(format!("retention-reuse-{i}.jsonl"));
+        let out = f
+            .command(&f.repo, "git")
+            .env("GIT_TRACE2_EVENT", &trace)
+            .args(["push", "origin", "main"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(f.refs(&f.remote, RETENTION_PREFIX), pins);
+        let commands = traced_git_commands(&trace);
+        assert!(
+            !commands.iter().any(|args| {
+                args.windows(2).any(|pair| pair == ["lfs", "push"])
+                    || args
+                        .iter()
+                        .any(|arg| arg == "fast-import" || arg == "--no-verify")
+            }),
+            "covered retention roots must not trigger another publication"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|args| { args.iter().any(|arg| arg == "--max-count=1") })
+                .count(),
+            1,
+            "all roots must be checked in one ancestry walk"
+        );
+    }
+
+    // Keep only the newest local root. A mirror can delete individual remote
+    // ancestor refs while preserving all their pointers through this root.
+    let guard = local_pins
+        .iter()
+        .find(|reference| {
+            f.run(
+                &f.repo,
+                &["merge-base", "--is-ancestor", peer_oid.trim(), reference],
+            )
+            .status
+            .success()
+        })
+        .unwrap();
+    for reference in &local_pins {
+        if reference != guard {
+            f.git(&f.repo, &["update-ref", "-d", reference]);
+        }
+    }
+    let objects = stock_lfs_roots(&f);
+    f.git(&f.repo, &["push", "--mirror", "origin"]);
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX), vec![guard.clone()]);
+    assert_eq!(stock_lfs_roots(&f), objects);
+    let recovered = f.clone_repo("after-ancestry-mirror");
+    assert_eq!(
+        fs::read(recovered.join("a.bin")).unwrap(),
+        b"original clone content\n"
+    );
+    assert_eq!(
+        fs::read(recovered.join("b.bin")).unwrap(),
+        b"other clone content\n"
+    );
+}
+
+#[test]
+fn incremental_push_never_excludes_stale_tracking_refs() {
+    let f = Fixture::new();
+    f.publish_file(
+        "a.bin",
+        b"must be republished to this destination\n",
+        "source history",
+    );
+    f.git(&f.remote, &["update-ref", "-d", "refs/heads/main"]);
+    assert!(
+        !f.git(&f.repo, &["rev-parse", "refs/remotes/origin/main"])
+            .is_empty()
+    );
+    for path in f.objects().keys() {
+        fs::remove_file(path).unwrap();
+    }
+    f.push();
+    assert_eq!(
+        f.objects().len(),
+        1,
+        "stale tracking refs must not hide the recipe"
+    );
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 2);
+}
+
+#[test]
+fn incremental_push_overincludes_when_destination_tips_are_not_local() {
+    let f = Fixture::new();
+    f.publish_file("a.bin", b"safe to negotiate again\n", "shared ancestor");
+    let tree = f.git(&f.remote, &["rev-parse", "main^{tree}"]);
+    let unseen = f.git(
+        &f.remote,
+        &[
+            "-c",
+            "user.name=Remote",
+            "-c",
+            "user.email=remote@example.com",
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "main",
+            "-m",
+            "unfetched destination commit",
+        ],
+    );
+    f.git(&f.remote, &["update-ref", "refs/heads/main", unseen.trim()]);
+    assert!(
+        !f.run(&f.repo, &["cat-file", "-e", unseen.trim()])
+            .status
+            .success()
+    );
+    for path in f.objects().keys() {
+        fs::remove_file(path).unwrap();
+    }
+    f.git(&f.repo, &["push", "origin", "HEAD:refs/heads/new-branch"]);
+    assert_eq!(
+        f.objects().len(),
+        1,
+        "the unavailable tip cannot exclude its ancestors"
+    );
+    assert_eq!(f.refs(&f.remote, RETENTION_PREFIX).len(), 2);
+    assert!(
+        !f.run(&f.repo, &["cat-file", "-e", unseen.trim()])
+            .status
+            .success(),
+        "optimization must not fetch remote tips"
+    );
+}
+
+#[test]
+fn file_full_push_does_not_read_cached_chunks_already_on_the_server() {
+    let f = Fixture::file();
+    f.publish_file(
+        "a.bin",
+        b"only the remote copy is needed\n",
+        "valid publication",
+    );
+    for path in objects_at(&f.repo.join(".git/cdc/lfs/objects")).keys() {
+        // File transport may hardlink uploaded bytes. Replace the cache inode
+        // to damage only the local copy, preserving the server's valid data.
+        fs::remove_file(path).unwrap();
+        fs::write(
+            path,
+            b"corrupt cache ignored when remote already has the object",
+        )
+        .unwrap();
+    }
+    f.git(
+        &f.repo,
+        &["-c", "cdc.lfs.fullPush=true", "push", "origin", "main"],
+    );
+    let clone = f.clone_repo("healthy-server-with-corrupt-source-cache");
+    assert_eq!(
+        fs::read(clone.join("a.bin")).unwrap(),
+        b"only the remote copy is needed\n"
+    );
+}
+
+#[test]
+fn ordinary_clone_mirror_with_only_markdown_changes_preserves_pins() {
+    let f = Fixture::new();
+    f.publish_file("a.bin", b"mirror with no new recipe\n", "source history");
+    let original = stock_lfs_roots(&f);
+    let clone = f.clone_repo("mirror-markdown");
+    fs::write(clone.join("note.md"), b"ordinary file change\n").unwrap();
+    f.git(&clone, &["add", "note.md"]);
+    f.git(&clone, &["commit", "-qm", "mirror ordinary changes"]);
+    assert!(f.refs(&clone, RETENTION_PREFIX).is_empty());
+    f.git(&clone, &["push", "--mirror", "origin"]);
+    assert_eq!(stock_lfs_roots(&f), original);
+    let recovered = f.clone_repo("after-mirror-markdown");
+    assert_eq!(
+        fs::read(recovered.join("a.bin")).unwrap(),
+        b"mirror with no new recipe\n"
+    );
+}
+
+#[test]
+fn history_cache_checks_many_pushed_tips_in_one_walk() {
+    let f = Fixture::file();
+    f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
+    f.write("a.bin", b"shared historical chunk\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    let base = f.commit("shared base");
+    let tree = f.git(&f.repo, &["rev-parse", "HEAD^{tree}"]);
+    let mut previous = BTreeMap::new();
+    for i in 0..32 {
+        let tip = f.git(
+            &f.repo,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                &base,
+                "-m",
+                &format!("old tip {i}"),
+            ],
+        );
+        let tip = tip.trim().to_owned();
+        let reference = format!("refs/heads/topic-{i}");
+        f.git(&f.repo, &["update-ref", &reference, &tip]);
+        previous.insert(reference, tip);
+    }
+    let publish = |tips: &BTreeMap<String, String>, label: &str| {
+        let mut updates = tempfile::tempfile().unwrap();
+        for (reference, tip) in tips {
+            writeln!(updates, "{reference} {tip} {reference} {}", "0".repeat(40)).unwrap();
+        }
+        updates.rewind().unwrap();
+        let trace = f.temp.path().join(format!("{label}.jsonl"));
+        let output = f
+            .command(&f.repo, BIN)
+            .args(["lfs-pre-push", "origin", f.remote.to_str().unwrap()])
+            .env("GIT_TRACE2_EVENT", &trace)
+            .env("GIT_CDC_TRACE", "1")
+            .stdin(Stdio::from(updates))
+            .output()
+            .unwrap();
+        let report = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{label}: {report}");
+        (report, traced_git_commands(&trace))
+    };
+    publish(&previous, "initial-many-tips");
+    f.write("a.bin", b"new shared chunk\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    let shared_tree = f.git(&f.repo, &["write-tree"]);
+    f.write("a.bin", b"chunk unique to the first branch\n");
+    f.git(&f.repo, &["add", "a.bin"]);
+    let unique_tree = f.git(&f.repo, &["write-tree"]);
+    let manifest = f.manifest(":a.bin");
+    let unique = &manifest.extra[&format!("lfs.{}", manifest.chunks[0].hash.to_hex())];
+    let mut current = BTreeMap::new();
+    for (i, (reference, parent)) in previous.iter().enumerate() {
+        let tree = if i == 0 { &unique_tree } else { &shared_tree };
+        let tip = f.git(
+            &f.repo,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                parent,
+                "-m",
+                &format!("new tip {i}"),
+            ],
+        );
+        let tip = tip.trim().to_owned();
+        f.git(&f.repo, &["update-ref", reference, &tip]);
+        current.insert(reference.clone(), tip);
+    }
+    let (report, commands) = publish(&current, "advanced-many-tips");
+    let ancestry_checks = commands
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg == "--is-ancestor"))
+        .count();
+    assert_eq!(
+        ancestry_checks, 0,
+        "history reuse must not spawn pairwise ancestry checks"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|args| args.iter().any(|arg| arg == "--max-count=1"))
+            .count(),
+        1
+    );
+    assert!(
+        report.contains("3 chunks, 1 reused, 32 excluded tips"),
+        "{report}"
+    );
+    assert_eq!(f.objects().len(), 3);
+
+    // One lost branch must invalidate the whole snapshot. Its unique chunk
+    // is unavailable, so retaining it would also make this publication fail.
+    for path in objects_at(&f.repo.join(".git/cdc/lfs/objects"))
+        .keys()
+        .chain(f.objects().keys())
+    {
+        if object_name(path) == *unique {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    f.git(&f.repo, &["update-ref", "-d", "refs/heads/topic-0"]);
+    let lost_tip = current.remove("refs/heads/topic-0").unwrap();
+    let cache = f.repo.join(".git/cdc/lfs/history-v2.json");
+    let saved = fs::read(&cache).unwrap();
+    for missing in [false, true] {
+        if missing {
+            f.git(&f.repo, &["reflog", "expire", "--expire=now", "--all"]);
+            f.git(&f.repo, &["prune", "--expire=now"]);
+            assert!(
+                !f.run(&f.repo, &["cat-file", "-e", &lost_tip])
+                    .status
+                    .success()
+            );
+            fs::write(&cache, &saved).unwrap();
+        }
+        let (report, _) = publish(
+            &current,
+            if missing {
+                "missing-cached-tip"
+            } else {
+                "lost-branch"
+            },
+        );
+        assert!(
+            report.contains("2 chunks, 0 reused, 0 excluded tips"),
+            "{report}"
+        );
+    }
 }
 
 #[test]
@@ -2499,7 +3155,7 @@ fn unchanged_history_cache_is_not_rewritten_for_a_new_destination() {
         b"same history, new destination\n",
         "cache metadata",
     );
-    let cache = f.repo.join(".git/cdc/lfs/history-v1.json");
+    let cache = f.repo.join(".git/cdc/lfs/history-v2.json");
     let marker = utils::cache_write_marker(&cache);
     let destination = f.temp.path().join("other-destination.git");
     f.git(
@@ -2522,6 +3178,7 @@ fn unchanged_history_cache_is_not_rewritten_for_a_new_destination() {
 #[test]
 fn history_cache_never_substitutes_for_remote_availability() {
     let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
     f.publish_file("a.bin", b"must still exist remotely\n", "cached ancestry");
     let published = f.git(&f.remote, &["rev-parse", "refs/heads/main"]);
     let objects = f.objects();
@@ -2548,10 +3205,137 @@ fn history_cache_never_substitutes_for_remote_availability() {
 }
 
 #[test]
+fn history_cache_is_disabled_while_grafts_are_active() {
+    for source in ["repository", "environment", "worktree"] {
+        let f = Fixture::file();
+        f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
+        f.write("a.bin", b"historical chunk hidden by a graft\n");
+        f.git(&f.repo, &["add", "a.bin"]);
+        f.commit("historical version");
+        f.write("a.bin", b"current chunk visible with a graft\n");
+        f.git(&f.repo, &["add", "a.bin"]);
+        let tip = f.commit("current version");
+        let repo = if source == "worktree" {
+            let worktree = f.temp.path().join("linked-worktree");
+            f.git(
+                &f.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    worktree.to_str().unwrap(),
+                    &tip,
+                ],
+            );
+            worktree
+        } else {
+            f.repo.clone()
+        };
+        let expected: std::collections::BTreeSet<_> =
+            objects_at(&f.repo.join(".git/cdc/lfs/objects"))
+                .keys()
+                .map(|path| object_name(path))
+                .collect();
+        assert_eq!(expected.len(), 2);
+        let cache = f.repo.join(".git/cdc/lfs/history-v2.json");
+        let grafts = if source == "environment" {
+            f.temp.path().join("custom-grafts")
+        } else {
+            f.repo.join(".git/info/grafts")
+        };
+        let publish = |grafted| {
+            let mut updates = tempfile::tempfile().unwrap();
+            writeln!(
+                updates,
+                "refs/heads/main {tip} refs/heads/main {}",
+                "0".repeat(40)
+            )
+            .unwrap();
+            updates.rewind().unwrap();
+            let mut command = f.command(&repo, BIN);
+            command
+                .args(["lfs-pre-push", "origin", f.remote.to_str().unwrap()])
+                .env("GIT_CDC_TRACE", "1")
+                .env_remove("GIT_GRAFT_FILE")
+                .stdin(Stdio::from(updates));
+            if source == "environment" && grafted {
+                command.env("GIT_GRAFT_FILE", &grafts);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{source}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stderr).unwrap()
+        };
+
+        fs::write(&grafts, format!("{tip}\n")).unwrap();
+        publish(true);
+        assert_eq!(
+            f.objects().len(),
+            1,
+            "{source}: graft must hide the ancestor"
+        );
+        let cached_while_grafted = cache.exists();
+        fs::remove_file(&grafts).unwrap();
+        publish(false);
+        let published = f.objects().keys().map(|path| object_name(path)).collect();
+        assert_eq!(
+            expected, published,
+            "{source}: unchanged tips must upload newly visible historical chunks"
+        );
+        assert!(
+            !cached_while_grafted,
+            "{source}: grafted history must not populate the cache"
+        );
+
+        // A previously complete cache must also be ignored and left intact
+        // during a grafted scan, so removing the graft can safely reuse it.
+        let saved = fs::read(&cache).unwrap();
+        let marker = utils::cache_write_marker(&cache);
+        fs::write(&grafts, format!("{tip}\n")).unwrap();
+        let report = publish(true);
+        assert!(
+            report.contains("1 chunks, 0 reused, 0 excluded tips"),
+            "{source}: {report}"
+        );
+        assert_eq!(fs::read(&cache).unwrap(), saved, "{source}");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().modified().unwrap(),
+            marker,
+            "{source}"
+        );
+        fs::remove_file(&grafts).unwrap();
+        let report = publish(false);
+        assert!(
+            report.contains("2 chunks, 2 reused, 1 excluded tips"),
+            "{source}: {report}"
+        );
+
+        // Metadata from before this guard must not survive an upgrade.
+        let mut old_cache: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        old_cache["version"] = serde_json::json!(1);
+        fs::write(
+            f.repo.join(".git/cdc/lfs/history-v1.json"),
+            serde_json::to_vec(&old_cache).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&cache).unwrap();
+        let report = publish(false);
+        assert!(
+            report.contains("2 chunks, 0 reused, 0 excluded tips"),
+            "{source}: {report}"
+        );
+    }
+}
+
+#[test]
 fn history_cache_falls_back_for_corruption_and_unrelated_history() {
     let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
     f.publish_file("a.bin", b"first branch\n", "first branch");
-    let cache = f.repo.join(".git/cdc/lfs/history-v1.json");
+    let cache = f.repo.join(".git/cdc/lfs/history-v2.json");
     fs::write(&cache, b"truncated cache").unwrap();
     f.write("a.bin", b"second version\n");
     f.git(&f.repo, &["add", "a.bin"]);
@@ -2590,6 +3374,7 @@ fn history_cache_falls_back_for_corruption_and_unrelated_history() {
 #[test]
 fn cold_cache_push_negotiates_existing_objects_without_downloading_them() {
     let f = Fixture::new();
+    f.git(&f.repo, &["config", "cdc.lfs.fullPush", "true"]);
     let data = test_data(6 * 1024 * 1024, 451);
     f.publish_file("a.bin", &data, "published content");
     f.write("note.txt", b"metadata-only update\n");

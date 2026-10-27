@@ -32,6 +32,7 @@ configuration. Its git-cdc settings:
 | --- | ------- |
 | `cdc.storage` | Set to `lfs` by `git cdc install --lfs`, so plain `git cdc track` uses the LFS backend |
 | `cdc.lfs.transferBatchBytes` | Most missing chunk data a push downloads per batch when chunks aren't cached locally (default `64m`; `k`/`m`/`g` suffixes work) |
+| `cdc.lfs.fullPush` | `true` makes every push check all CDC files in the pushed history instead of only new ones, to repair a bypassed push or an LFS endpoint move (default `false`; usually set for one push with `git -c`) |
 
 ## Filter registration
 

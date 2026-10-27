@@ -99,29 +99,50 @@ default answer is No, and non-interactive runs keep everything.
 
 ## Pushing
 
-Before Git updates any remote refs, the pre-push hook uploads every chunk the
-pushed history needs that the LFS server does not already have. If an upload
-fails, the push fails. Later pushes only scan new history.
+Before Git updates any remote refs, the pre-push hook finds CDC files in the
+commits you're pushing that aren't already on the destination's branches or
+tags. It checks their chunks with the LFS server and uploads any that are
+missing. If an upload fails, the push fails. History already on those branches
+and tags was covered by earlier pushes, so a push that only changes ordinary
+files transfers no chunks. Pull-request refs don't count as covered, because
+their commits can come from forks with separate LFS storage.
 
 If a push needs chunks that aren't in the local cache, for example when
 mirroring history, it downloads them in batches of up to 64 MiB and removes
 them afterwards. To use less temporary disk, lower the limit with
 `git config cdc.lfs.transferBatchBytes 16m`.
 
-The hook then pushes a small internal ref under `refs/notes/git-cdc-lfs/`. It
-holds ordinary LFS pointers to the uploaded chunks, so servers that delete
-unreferenced LFS objects keep them. Do not delete these refs. They appear in
-`git log --all` and mirror clones, but not in branch or tag lists.
+When there are chunks to publish, the hook pushes a small internal ref under
+`refs/notes/git-cdc-lfs/`. It holds ordinary LFS pointers to those chunks, so
+servers that delete unreferenced LFS objects keep them. Do not delete these
+refs. They appear in `git log --all` and mirror clones, but not in branch or tag lists.
+After another clone has published, your next push may publish one of these
+refs with no new chunks, to keep the other clone's chunks protected.
 
-- `git push --dry-run` still uploads chunks and the internal ref, because Git
-  runs pre-push hooks for dry runs. It does not update branches or tags.
+After a hook bypass, an LFS endpoint move, missing retention refs, or suspected
+server data loss, opt into a full check:
+
+```sh
+git -c cdc.lfs.fullPush=true push origin main
+```
+
+This checks every CDC file in the pushed history, uploads any missing chunks and
+publishes a fresh retention ref for all of them. Missing chunks must be in your
+local cache or downloadable from a remote. It works even when there's nothing
+new to push. Ordinary pushes never repair history that is already published.
+To check every push this way, use `git config cdc.lfs.fullPush true`.
+
+- `git push --dry-run` still prepares required chunks and retention refs,
+  because Git runs pre-push hooks for dry runs. It does not update branches or
+  tags.
 - `GIT_CDC_TRACE=1 git push` prints timings for each phase of the hook.
 
 ## Limits
 
 - **Every pushing computer needs the hook.** `git push --no-verify`, hosting
   APIs, or a computer without git-cdc can publish commits whose chunks were
-  never uploaded.
+  never uploaded. Later ordinary pushes don't notice; run a
+  [full check](#pushing) to repair them.
 - **Shallow clones cannot push** (except ref deletions) until
   `git fetch --unshallow` succeeds.
 - **Server retention.** Chunks are protected on servers that keep LFS objects
@@ -130,7 +151,8 @@ unreferenced LFS objects keep them. Do not delete these refs. They appear in
   objects regardless of references, are not covered. See the
   [retention analysis](../../lfs-retention.md).
 - **No server-side cleanup.** git-cdc has no garbage collection for the LFS
-  server, and the internal retention refs grow with each push.
+  server, and the internal retention refs grow with chunk publications and
+  retention-preservation updates.
 - **No compression.** Chunks are stored raw, not zstd-compressed as with the
   other backends.
 - **File size.** A file can have at most 65,536 chunks, roughly 128 GiB at the

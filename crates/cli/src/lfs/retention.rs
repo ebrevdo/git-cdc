@@ -39,9 +39,10 @@ pub(super) fn parse_remote_roots(output: &str) -> Result<Vec<(String, String)>> 
 
 pub(super) fn visit_objects(
     tips: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
     visit: impl FnMut(&str, u64) -> Result<()>,
 ) -> Result<()> {
-    visit_pointers_with(tips, None, visit, git_without_replacements)
+    visit_pointers_with(tips, excluded, None, visit, git_without_replacements)
 }
 
 pub(super) fn visit_candidates_with(
@@ -51,18 +52,19 @@ pub(super) fn visit_candidates_with(
     command: impl FnMut() -> Command,
 ) -> Result<()> {
     let paths: BTreeSet<_> = wanted.keys().map(|oid| pointer_path(oid)).collect();
-    visit_pointers_with(tips, Some(&paths), visit, command)
+    visit_pointers_with(tips, &BTreeSet::new(), Some(&paths), visit, command)
 }
 
 fn visit_pointers_with(
     tips: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
     paths: Option<&BTreeSet<String>>,
     mut visit: impl FnMut(&str, u64) -> Result<()>,
     command: impl FnMut() -> Command,
 ) -> Result<()> {
     visit_blobs_with(
         tips,
-        &BTreeSet::new(),
+        excluded,
         None,
         paths,
         |head| head.starts_with(LFS_POINTER_VERSION.as_bytes()),
@@ -95,26 +97,10 @@ fn visit_pointers_with(
     )
 }
 
-fn previous_roots(target: &PushRemote) -> Result<Vec<String>> {
+fn previous_roots(target: &PushRemote, advertised: &[(String, String)]) -> Result<Vec<String>> {
     // Named remotes can fetch from a different repository than they push to.
     // The hook supplies the destination whose existing roots must survive.
-    let found = target
-        .command()
-        .args([
-            "ls-remote",
-            "--refs",
-            &target.destination,
-            &format!("{PREFIX}*"),
-        ])
-        .output()?;
-    ensure!(
-        found.status.success(),
-        "cannot discover LFS retention roots: {}",
-        String::from_utf8_lossy(&found.stderr)
-    );
-    let refs: BTreeMap<_, _> = parse_remote_roots(&String::from_utf8(found.stdout)?)?
-        .into_iter()
-        .collect();
+    let refs: BTreeMap<_, _> = advertised.iter().cloned().collect();
     if refs.is_empty() {
         return Ok(Vec::new());
     }
@@ -279,9 +265,9 @@ pub(super) struct Publication<'a> {
 }
 
 impl<'a> Publication<'a> {
-    pub fn new(target: &'a PushRemote) -> Result<Self> {
+    pub fn new(target: &'a PushRemote, advertised: &[(String, String)]) -> Result<Self> {
         let started = std::time::Instant::now();
-        let parents = previous_roots(target)?;
+        let parents = previous_roots(target, advertised)?;
         super::trace(
             "retention discovery",
             started,

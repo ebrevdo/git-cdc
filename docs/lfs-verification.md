@@ -2,7 +2,7 @@
 
 Implementation based on upstream commit
 `6a1f791f50295edd9f2ed827e30761d74789b5bc`.
-Latest verification run: October 26, 2026, UTC.
+Latest verification run: October 27, 2026, UTC.
 
 ## Environment and commands
 
@@ -34,8 +34,10 @@ suites, including the HTTP-only tests.
 
 | Check | Result |
 |---|---|
-| Workspace regression suite | 157 passed, 0 failed; 2 HTTP-only tests ignored |
-| Full LFS suite with reference HTTP server | 66 passed, 0 failed, 0 ignored |
+| Workspace regression suite | 209 passed, 0 failed; 2 HTTP-only tests ignored |
+| Full LFS suite with reference HTTP server | 88 passed, 0 failed, 0 ignored |
+| Warm-transfer regressions, file / HTTP | 4 passed / 4 passed |
+| Cold-mirror recovery budget regression | Passed |
 | Lifecycle regressions on Git LFS 3.8.1 | 23 passed, 0 failed |
 | Clippy, all targets, warnings denied | Passed |
 | Rust formatting | Passed |
@@ -44,15 +46,45 @@ suites, including the HTTP-only tests.
 These counts describe test executions, not distinct proofs: the explicit
 reference-server test repeats the main history-recovery workflow. The original
 backend, core and server regression tests remain included in the workspace run.
+The complete-suite counts are from the prior full run. Subsequent batching and
+ref-query updates were checked with targeted warm-transfer, cold-mirror, and
+incremental-publication regressions.
 
-Push-bookkeeping regressions cover one combined retention root across several
-128-object transfer batches, ancestry-cache reuse, corrupt-cache fallback,
-unrelated histories, and missing remote content despite cached metadata. Git
-Trace2 records one retention discovery and one retention push for an 80 MiB
-fixture. With its local chunks removed, the next HTTP push reuses 19 chunk
-records and completes one LFS client invocation without downloading content.
-These are local regression measurements; the production migration's push time
-has not been measured with this implementation.
+Push-bookkeeping regressions cover destination-aware recipe scanning, one
+combined warm transfer within bounded 512-chunk groups, ancestry-cache reuse for
+full checks, corrupt-cache fallback, and missing remote content despite cached
+metadata in full-check mode. Git Trace2 records one destination discovery and
+one retention push for an 80 MiB fixture. Discovery requests only the branch,
+tag, and retention ref patterns, checked through the recorded command arguments.
+With its local chunks removed, the
+next ordinary-file push runs no CDC LFS upload, fast-import, or retention push.
+These are local regression measurements; production push time has not been
+measured with this implementation.
+
+### Incremental publication checks, October 27, 2026
+
+With Git LFS 3.6.1 and the reference HTTP server, an ordinary-file push after
+80 MiB of CDC history completed in 145 ms with its local chunk cache removed.
+The hook reported zero chunks from new recipes and ran no CDC upload or
+retention publication. This is a local end-to-end Git push measurement, not a
+hosted-server latency guarantee.
+
+Regressions also cover shared destination tags, stale tracking refs, unavailable
+destination tips, full-check repair without a new commit, file-server presence
+despite a corrupt local cache, mirror pushes with only ordinary-file changes,
+and successful warm uploads under a 192-descriptor limit. A full push with more
+than 1,024 chunks under a 1,024-descriptor limit uses planned groups of at most
+512 chunks, without falling back to 128-object batches. Existing history-cache
+ancestry and graft regressions remain enabled in full-check mode.
+
+Imported review commits are tested under GitHub pull-request, GitLab
+merge-request/keep-around, and Gerrit change ref names on local Git remotes.
+Their merged chunks are uploaded when available; missing chunks block the user
+ref update. Git's supplied old values still permit incremental custom-ref
+updates. A two-clone regression publishes one preservation root, then performs
+three ordinary-file pushes without another CDC transfer or retention update.
+A subsequent mirror deletes individual ancestor refs while preserving every
+chunk through the remaining local descendant.
 
 ### Publication regression checks, October 26, 2026
 
@@ -141,11 +173,20 @@ rejection is tested to fail closed before user refs are published.
 Storage preparation, including internal refs, can occur during a dry run or
 remain after an unsuccessful outer push. User branches/tags are unchanged by
 that preparation. Internal refs can appear in explicit all-ref logs.
-Retention-metadata GC is not implemented. Cache misses still scan complete
-history, and every push negotiates remote chunk availability. Warm pushes
-combine retention updates; cold migrations checkpoint recovered chunks before
-eviction. Metadata-ref ancestry still adds push cost. Unverified host-specific
-policies remain outside the retention guarantee.
+Retention-metadata GC is not implemented. Incremental pushes exclude history
+already on the destination; full checks and empty destinations may scan complete
+history. `cdc.lfs.fullPush=true` opts into repair of previously published data.
+Warm pushes combine transfers and retention updates; cold migrations checkpoint
+recovered chunks before eviction. File uploads verify cached content only when
+it is needed; HTTP/custom transfers still verify all locally cached candidates
+from the selected recipes. A remote retention root unreachable from local
+retention refs triggers a conservative preservation root. Its local descendant
+then covers those remote roots for subsequent pushes, even when their individual
+ref names remain absent locally. Recipe exclusions use destination branches,
+tags, and the old values of updated refs; provider-managed review refs do not
+establish chunk availability. Metadata-ref ancestry still adds cost when
+publication is needed.
+Unverified host-specific policies remain outside the retention guarantee.
 
 CDC paths use binary hunk/merge semantics. Shallow non-deletion pushes remain
 restricted. Legacy CDC history stays in its original backend. Client hook

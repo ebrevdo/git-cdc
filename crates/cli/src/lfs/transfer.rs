@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::{PushRemote, Store, git_out, lfs_pointer, repo_root, retention};
 
 const BATCH_OBJECTS: usize = 128;
+const WARM_BATCH_OBJECTS: usize = 512;
 
 fn batch_bytes() -> Result<u64> {
     let key = "cdc.lfs.transferBatchBytes";
@@ -67,29 +68,56 @@ fn pointer_objects(batch: &[(&str, &Object)]) -> BTreeMap<String, u64> {
         .collect()
 }
 
+fn exhausted_file_descriptors(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    // EMFILE / ENFILE on Unix; ERROR_TOO_MANY_OPEN_FILES on Windows.
+    #[cfg(unix)]
+    return matches!(error.raw_os_error(), Some(23 | 24));
+    #[cfg(windows)]
+    return error.raw_os_error() == Some(4);
+    #[cfg(not(any(unix, windows)))]
+    false
+}
+
 pub(super) fn publish(
     store: &Store,
     target: &PushRemote,
     objects: &BTreeMap<String, Object>,
+    roots: &[(String, String)],
 ) -> Result<()> {
     let mut session = TransferSession {
         store,
         target,
         batch_bytes: batch_bytes()?,
         file: FileUpload::start(store, target)?,
-        publication: retention::Publication::new(target)?,
+        publication: retention::Publication::new(target, roots)?,
         pending: BTreeMap::new(),
     };
-    let mut batch = Vec::new();
-    for (oid, object) in objects {
-        if batch.len() == BATCH_OBJECTS {
-            session.publish_batch(&batch)?;
-            batch.clear();
+    let batch: Vec<_> = objects
+        .iter()
+        .map(|(oid, object)| (oid.as_str(), object))
+        .collect();
+    let batch_limit = if batch.iter().all(|(oid, _)| store.path(oid).is_file()) {
+        // Bound leases before opening files. One client per warm group still
+        // combines several server requests without exhausting ordinary limits.
+        WARM_BATCH_OBJECTS
+    } else {
+        BATCH_OBJECTS
+    };
+    for batch in batch.chunks(batch_limit) {
+        match session.publish_batch(batch) {
+            Ok(()) => {}
+            Err(error) if batch.len() > BATCH_OBJECTS && exhausted_file_descriptors(&error) => {
+                // Some systems have low descriptor limits. The failed call
+                // releases its leases; retain the bounded path as a fallback.
+                for batch in batch.chunks(BATCH_OBJECTS) {
+                    session.publish_batch(batch)?;
+                }
+            }
+            Err(error) => return Err(error),
         }
-        batch.push((oid.as_str(), object));
-    }
-    if !batch.is_empty() {
-        session.publish_batch(&batch)?;
     }
     if !session.pending.is_empty() {
         session.publication.publish(&session.pending)?;
@@ -120,9 +148,13 @@ impl TransferSession<'_> {
             .map(|(_, object)| object.size)
             .sum();
         let started = std::time::Instant::now();
-        for (oid, object) in batch {
-            if self.store.path(oid).is_file() {
-                self.verify(oid, object)?;
+        if self.file.is_none() {
+            // The stock CLI does not expose the server's missing-object set.
+            // Keep verifying upload candidates before handing it any bytes.
+            for (oid, object) in batch {
+                if self.store.path(oid).is_file() {
+                    self.verify(oid, object)?;
+                }
             }
         }
         super::trace(
@@ -132,7 +164,7 @@ impl TransferSession<'_> {
         );
         if missing_bytes > self.batch_bytes && batch.len() > 1 {
             // Cold history often already exists remotely. Negotiate metadata
-            // first, keeping credentials in one client for up to 128 objects.
+            // first, keeping credentials in one client for the group.
             // Only failed negotiations need smaller recovery batches.
             let started = std::time::Instant::now();
             if self.file.is_none() {
@@ -248,13 +280,18 @@ impl TransferSession<'_> {
         batch: &[(&str, &Object)],
         fetched: &mut Vec<String>,
     ) -> Result<()> {
+        let absent = file.probe.path().join("missing-source");
         for (oid, object) in batch {
             let path = self.store.path(oid);
-            if file.upload(oid, object.size, &path)? {
+            // Probe without a source path: the adapter checks remote presence
+            // first. Hash cached bytes only if an upload is actually required.
+            if file.upload(oid, object.size, &absent)? {
                 continue;
             }
             if !path.is_file() {
                 self.recover(oid, object, fetched)?;
+            } else {
+                self.verify(oid, object)?;
             }
             ensure!(
                 file.upload(oid, object.size, &path)?,
@@ -305,6 +342,7 @@ struct FileUpload {
     child: Child,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
+    probe: tempfile::TempDir,
 }
 
 impl FileUpload {
@@ -331,6 +369,7 @@ impl FileUpload {
             input: child.stdin.take(),
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
+            probe: tempfile::tempdir()?,
         };
         let response = client.request(json!({
             "event": "init",

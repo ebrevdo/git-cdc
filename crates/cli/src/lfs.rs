@@ -20,6 +20,7 @@ pub(crate) mod cache;
 mod context;
 mod history;
 mod hooks;
+mod push;
 mod retention;
 mod transfer;
 
@@ -597,6 +598,7 @@ pub fn pre_push(remote: &str, url: &str) -> Result<()> {
     updates.rewind()?;
     let mut tips = BTreeSet::new();
     let mut managed_tips = BTreeSet::new();
+    let mut remote_tips = BTreeSet::new();
     let mut ordinary = tempfile::tempfile()?;
     for line in BufReader::new(&mut updates).lines() {
         let line = line?;
@@ -606,6 +608,9 @@ pub fn pre_push(remote: &str, url: &str) -> Result<()> {
         };
         for oid in [local_oid, remote_oid] {
             ensure!(is_git_oid(oid), "invalid pushed object id");
+        }
+        if !remote_oid.bytes().all(|b| b == b'0') {
+            remote_tips.insert(remote_oid.to_string());
         }
         let managed = remote_ref.starts_with(retention::PREFIX);
         if !local_oid.bytes().all(|b| b == b'0') {
@@ -638,23 +643,49 @@ pub fn pre_push(remote: &str, url: &str) -> Result<()> {
         .status()?;
     ensure!(status.success(), "standard Git LFS pre-push failed");
     trace("stock LFS pre-push", started, "completed");
+    let destination = push::Destination::discover(&target, remote_tips)?;
+    let full = push::full_check()?;
+    if full && tips.is_empty() {
+        // An up-to-date push supplies no updates. Still allow a full check to
+        // repair locally available destination history without a dummy commit.
+        tips.extend(destination.available.iter().cloned());
+        managed_tips.extend(
+            destination
+                .roots
+                .iter()
+                .filter(|(oid, _)| destination.available.contains(oid))
+                .map(|(oid, _)| oid.clone()),
+        );
+    }
     let mut objects = BTreeMap::new();
     if !tips.is_empty() {
         ensure!(
             git_out(&["rev-parse", "--is-shallow-repository"])? == "false",
             "cannot verify complete LFS history from a shallow repository; fetch --unshallow first"
         );
-        objects = history::collect(&tips)?;
+        objects = if full || destination.excluded.is_empty() {
+            history::collect(&tips)?
+        } else {
+            history::collect_new(&tips, &destination.excluded)?
+        };
         if !managed_tips.is_empty() {
-            retention::visit_objects(&managed_tips, |oid, size| {
+            let excluded = if full {
+                BTreeSet::new()
+            } else {
+                destination.excluded.clone()
+            };
+            retention::visit_objects(&managed_tips, &excluded, |oid, size| {
                 transfer::add_object(&mut objects, oid, size, None)
             })?;
         }
     }
     if objects.is_empty() {
-        retention::Publication::new(&target)?.publish(&BTreeMap::new())
+        if destination.needs_retention_guard()? {
+            retention::Publication::new(&target, &destination.roots)?.publish(&BTreeMap::new())?;
+        }
+        Ok(())
     } else {
-        transfer::publish(&Store::new()?, &target, &objects)
+        transfer::publish(&Store::new()?, &target, &objects, &destination.roots)
     }
 }
 
