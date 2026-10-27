@@ -311,6 +311,128 @@ fn filter_process_alone_round_trips_many_files() {
 }
 
 #[test]
+#[cfg(unix)]
+fn inheritance_skips_new_paths_and_oversized_raw_blobs() {
+    let dir = scratch_repo();
+    let repo = dir.path();
+    let data = vec![7; 16 * 1024 * 1024 + 1];
+    fs::write(repo.join("large.bin"), &data).unwrap();
+    let raw_oid = git(repo, &["hash-object", "-w", "--no-filters", "large.bin"]);
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            raw_oid.trim(),
+            "large.bin",
+        ],
+    );
+    // Make Git run clean even though the existing index contains the raw blob.
+    fs::write(repo.join("large.bin"), &data).unwrap();
+    for i in 0..8 {
+        fs::write(repo.join(format!("new-{i}.bin")), [i as u8; 512]).unwrap();
+    }
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["add", "."]);
+    let tracing = tempfile::tempdir().unwrap();
+    let (out, requests) = utils::record_blob_requests(&mut command, tracing.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        requests.is_empty(),
+        "no indexed recipe contents are needed: {requests:?}"
+    );
+    let manifest = Manifest::parse(git(repo, &["show", ":large.bin"]).as_bytes()).unwrap();
+    assert_eq!(manifest.oid, blake3::hash(&data));
+    assert_eq!(git(repo, &["ls-files"]).lines().count(), 10);
+}
+
+#[test]
+fn inheritance_snapshots_the_index_only_for_larger_operations() {
+    // A few files are looked up individually; a long-running add switches to
+    // one index listing instead of a request per new path.
+    for (files, listings) in [(8, 0), (100, 1)] {
+        let dir = scratch_repo();
+        let repo = dir.path();
+        for i in 0..files {
+            fs::write(repo.join(format!("f{i}.bin")), [i as u8; 512]).unwrap();
+        }
+        let tracing = tempfile::tempdir().unwrap();
+        let trace = tracing.path().join("trace.json");
+        let out = Command::new("git")
+            .current_dir(repo)
+            .env("GIT_TRACE2_EVENT", &trace)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let snapshots = utils::traced_git_commands(&trace)
+            .iter()
+            .filter(|argv| {
+                argv.iter().any(|arg| arg == "ls-files") && argv.iter().any(|arg| arg == ":/")
+            })
+            .count();
+        assert_eq!(snapshots, listings, "{files} files");
+        assert_eq!(git(repo, &["ls-files"]).lines().count(), files + 1);
+    }
+}
+
+#[test]
+fn inheritance_uses_the_active_index_from_subdirectories_with_newline_paths() {
+    let dir = scratch_repo();
+    let repo = dir.path();
+    fs::create_dir(repo.join("sub")).unwrap();
+    let path = "sub/line\nbreak.bin";
+    fs::write(repo.join(path), [4u8; 512]).unwrap();
+    git(repo, &["add", "."]);
+    let original = git(repo, &["show", &format!(":{path}")]);
+    let alternate = repo.join("alternate.index");
+    fs::copy(repo.join(".git/index"), &alternate).unwrap();
+    // Change only the real index to another parameter set. The alternate
+    // still records the original default parameters, independently of HEAD.
+    git(repo, &["config", "cdc.chunk.avg", "1048576"]);
+    git(repo, &["config", "cdc.chunk.inherit", "false"]);
+    git(repo, &["add", "--renormalize", "."]);
+    git(repo, &["config", "cdc.chunk.inherit", "true"]);
+    let out = Command::new("git")
+        .current_dir(repo.join("sub"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_INDEX_FILE", &alternate)
+        .args(["add", "--renormalize", "."])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_INDEX_FILE", &alternate)
+        .args(["show", &format!(":{path}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, original.as_bytes());
+}
+
+#[test]
 fn one_shot_filters_still_work_without_process() {
     // git < 2.11 fallback: unset filter.cdc.process, forcing the one-shot
     // clean/smudge paths.

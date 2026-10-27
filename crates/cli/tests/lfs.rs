@@ -481,6 +481,70 @@ fn incremental_push_fresh_clone_and_every_historical_version() {
 }
 
 #[test]
+fn mixed_tiny_and_large_files_round_trip_and_preserve_recipes() {
+    let f = Fixture::file();
+    for key in ["cdc.chunk.min", "cdc.chunk.avg", "cdc.chunk.max"] {
+        f.git(&f.repo, &["config", "--unset", key]);
+    }
+    let large = test_data(2 * 1024 * 1024, 104);
+    f.write("000-large.bin", &large);
+    let tiny: Vec<_> = (0..8).map(|i| test_data(512, 1000 + i)).collect();
+    for (i, bytes) in tiny.iter().enumerate() {
+        f.write(&format!("tiny-{i:03}.bin"), bytes);
+    }
+    f.write("zzz-empty.bin", b"");
+    // Every clean result fits in RAM, including the large file's recipe.
+    // An unusable temp directory makes any per-file disk spool fail loudly.
+    let out = f
+        .command(&f.repo, "git")
+        .env("TMPDIR", f.temp.path().join("missing-temp-directory"))
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::remove_file(f.repo.join("tiny-000.bin")).unwrap();
+    let out = f
+        .command(&f.repo, "git")
+        .env("TMPDIR", f.temp.path().join("missing-temp-directory"))
+        .args(["checkout", "--", "tiny-000.bin"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(f.repo.join("tiny-000.bin")).unwrap(), tiny[0]);
+    let before = f.git(&f.repo, &["write-tree"]);
+    f.git(&f.repo, &["config", "cdc.chunk.avg", "1m"]);
+    f.git(&f.repo, &["add", "--renormalize", "."]);
+    assert_eq!(f.git(&f.repo, &["write-tree"]), before);
+    for (i, bytes) in tiny.iter().enumerate() {
+        let name = format!("tiny-{i:03}.bin");
+        let manifest = f.manifest(&format!(":{name}"));
+        assert_eq!(manifest.chunks.len(), 1);
+        assert_eq!(manifest.size, 512);
+        assert_eq!(manifest.oid, blake3::hash(bytes));
+        fs::remove_file(f.repo.join(name)).unwrap();
+    }
+    fs::remove_file(f.repo.join("000-large.bin")).unwrap();
+    fs::remove_file(f.repo.join("zzz-empty.bin")).unwrap();
+    f.git(&f.repo, &["checkout", "--", "."]);
+    assert_eq!(fs::read(f.repo.join("000-large.bin")).unwrap(), large);
+    assert!(fs::read(f.repo.join("zzz-empty.bin")).unwrap().is_empty());
+    for (i, bytes) in tiny.iter().enumerate() {
+        assert_eq!(
+            fs::read(f.repo.join(format!("tiny-{i:03}.bin"))).unwrap(),
+            *bytes
+        );
+    }
+}
+
+#[test]
 fn staged_snapshot_unrelated_changes_and_alternate_index() {
     let f = Fixture::new();
     f.write("a.bin", b"original\n");

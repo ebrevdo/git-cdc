@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Git, Stdio};
 
@@ -81,6 +81,9 @@ pub fn chunk_params() -> Result<ChunkParams> {
     .validate()
 }
 
+/// Per-path lookups before a filter process switches to an index snapshot.
+const PER_PATH_LOOKUPS: usize = 64;
+
 /// Resolves the chunk parameters `clean` should use for a given path.
 ///
 /// A file already tracked by git-cdc is re-chunked with the parameters its
@@ -91,11 +94,18 @@ pub fn chunk_params() -> Result<ChunkParams> {
 /// already has. Untracked (new) files, and repos with `cdc.chunk.inherit`
 /// set false, use the local config.
 ///
-/// Lookups go through one long-lived `git cat-file --batch`, so a filter
-/// process handling thousands of files spawns one child, not thousands.
+/// The first lookups query each path; a filter process that keeps going then
+/// snapshots the active index once, so later new paths need no Git request.
+/// Long-lived helpers check object sizes before reading candidate recipes;
+/// converting a large raw Git blob must not read its old contents as well.
 pub struct ChunkParamsFor {
     local: ChunkParams,
     inherit: bool,
+    snapshot_index: bool,
+    lookups: usize,
+    index: Option<HashMap<Vec<u8>, String>>,
+    cached: HashMap<String, Option<ChunkParams>>,
+    check: Option<CatFile>,
     batch: Option<CatFile>,
 }
 
@@ -114,8 +124,19 @@ impl ChunkParamsFor {
         ChunkParamsFor {
             local,
             inherit,
+            snapshot_index: false,
+            lookups: 0,
+            index: None,
+            cached: HashMap::new(),
+            check: None,
             batch: None,
         }
+    }
+
+    pub fn for_process(local: ChunkParams) -> Self {
+        let mut params = Self::new(local);
+        params.snapshot_index = true;
+        params
     }
 
     /// `None` path (the one-shot `clean` on an old install, whose filter
@@ -131,69 +152,127 @@ impl ChunkParamsFor {
     }
 
     fn committed(&mut self, path: &str) -> Option<ChunkParams> {
-        // Address a newline-bearing path through argv, then send its object
-        // id on the batch protocol. It still inherits the index's parameters.
-        let revision = if path.contains('\n') {
-            git_out(&["rev-parse", "--verify", &format!(":{path}")]).ok()?
+        let oid = if self.snapshot_index && self.lookups >= PER_PATH_LOOKUPS {
+            let index = self
+                .index
+                .get_or_insert_with(|| index_oids().unwrap_or_default());
+            index.get(path.as_bytes())?.clone()
         } else {
-            format!(":{path}")
+            // Small operations (and one-shot filters) look up each path, so
+            // adding a few files to a large repo never lists its whole index.
+            self.lookups += 1;
+            if path.contains('\n') {
+                git_out(&["rev-parse", "--verify", &format!(":{path}")]).ok()?
+            } else {
+                format!(":{path}")
+            }
         };
-        if self.batch.is_none() {
-            let mut child = Git::new("git")
-                .args(["cat-file", "--batch"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok()?;
-            self.batch = Some(CatFile {
-                stdin: BufWriter::new(child.stdin.take()?),
-                stdout: BufReader::new(child.stdout.take()?),
-                child,
-            });
+        if let Some(params) = self.cached.get(&oid) {
+            return *params;
         }
-        let batch = self.batch.as_mut()?;
+        let params = match self.read_params(&oid) {
+            Ok(params) => params,
+            Err(_) => {
+                // A truncated response must not desynchronize later lookups.
+                if let Some(batch) = self.batch.take() {
+                    batch.close();
+                }
+                if let Some(check) = self.check.take() {
+                    check.close();
+                }
+                None
+            }
+        };
+        // Bound this cache independently of repository size. Identical recipes
+        // share one lookup, without retaining every parsed manifest in memory.
+        if self.cached.len() >= 4096 {
+            self.cached.clear();
+        }
+        self.cached.insert(oid, params);
+        params
+    }
 
-        let header = batch.request(&revision).ok()?;
-        // "<oid> <type> <size>" for a hit; "<rev> missing" otherwise.
+    fn read_params(&mut self, oid: &str) -> Result<Option<ChunkParams>> {
+        if self.check.is_none() {
+            self.check = Some(CatFile::spawn("--batch-check")?);
+        }
+        let header = self.check.as_mut().unwrap().request(oid)?;
         let mut parts = header.split_whitespace();
-        let (_oid, typ, size) = (parts.next()?, parts.next()?, parts.next());
-        if typ == "missing" {
-            return None;
+        let (name, typ, size) = (parts.next(), parts.next(), parts.next());
+        if typ != Some("blob") {
+            return Ok(None);
         }
-        let size: u64 = size?.parse().ok()?;
-        let size = size as usize;
-        if typ != "blob" || size as u64 > MAX_MANIFEST_SIZE {
-            // Still must drain the body, or the stream desynchronises.
-            std::io::copy(
-                &mut (&mut batch.stdout).take(size as u64 + 1),
-                &mut std::io::sink(),
-            )
-            .ok()?;
-            return None;
+        let oid = name.context("missing blob ID")?;
+        let size: u64 = size.context("missing blob size")?.parse()?;
+        if size > MAX_MANIFEST_SIZE {
+            return Ok(None);
         }
-        let mut body = vec![0u8; size + 1]; // content + trailing LF
-        batch.stdout.read_exact(&mut body).ok()?;
-        body.pop();
-        let m = detect(&body)?;
+        if self.batch.is_none() {
+            self.batch = Some(CatFile::spawn("--batch")?);
+        }
+        let batch = self.batch.as_mut().unwrap();
+        writeln!(batch.stdin, "{oid}")?;
+        batch.stdin.flush()?;
+        let body = read_blob(&mut batch.stdout, oid, size)?;
+        let Some(m) = detect(&body) else {
+            return Ok(None);
+        };
         // A manifest committed with values fastcdc rejects must not be
         // inherited — chunking on them is undefined in a release build.
-        ChunkParams {
+        Ok(ChunkParams {
             min: m.chunk_min,
             avg: m.chunk_avg,
             max: m.chunk_max,
         }
         .validate()
-        .ok()
+        .ok())
     }
 }
 
 impl Drop for ChunkParamsFor {
     fn drop(&mut self) {
+        if let Some(check) = self.check.take() {
+            check.close();
+        }
         if let Some(batch) = self.batch.take() {
             batch.close();
         }
     }
+}
+
+/// NUL framing handles tabs/newlines in names, and --full-name works when
+/// the filter runs below the worktree root. Git honors GIT_INDEX_FILE here.
+fn index_oids() -> Result<HashMap<Vec<u8>, String>> {
+    let mut child = Git::new("git")
+        .args(["ls-files", "--stage", "--full-name", "-z", "--", ":/"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut result = HashMap::new();
+    let parsed = (|| -> Result<()> {
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut entry = Vec::new();
+        while reader.read_until(0, &mut entry)? != 0 {
+            ensure!(entry.pop() == Some(0), "incomplete index entry");
+            let tab = entry
+                .iter()
+                .position(|&b| b == b'\t')
+                .context("invalid index entry")?;
+            let metadata = std::str::from_utf8(&entry[..tab])?;
+            let mut fields = metadata.split_whitespace();
+            let (_mode, oid, stage) = (fields.next(), fields.next(), fields.next());
+            if let (Some(oid), Some("0")) = (oid, stage) {
+                result.insert(entry[tab + 1..].to_vec(), oid.to_owned());
+            }
+            entry.clear();
+        }
+        Ok(())
+    })();
+    let status = child.wait()?;
+    parsed?;
+    ensure!(status.success(), "cannot read active Git index");
+    Ok(result)
 }
 
 pub fn oid_str(hash: &blake3::Hash) -> String {
@@ -215,6 +294,20 @@ pub fn all_manifests() -> Result<Vec<Manifest>> {
 }
 
 impl CatFile {
+    fn spawn(mode: &str) -> Result<Self> {
+        let mut child = Git::new("git")
+            .args(["cat-file", mode])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self {
+            stdin: BufWriter::new(child.stdin.take().unwrap()),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        })
+    }
+
     fn request(&mut self, oid: &str) -> Result<String> {
         writeln!(self.stdin, "{oid}")?;
         self.stdin.flush()?;

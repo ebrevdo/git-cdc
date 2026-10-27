@@ -2,12 +2,11 @@
 
 Implementation based on upstream commit
 `6a1f791f50295edd9f2ed827e30761d74789b5bc`.
-Latest verification run: October 27, 2026, UTC.
 
 ## Environment and commands
 
 - Linux x86-64; Git 2.47.3; Git LFS 3.6.1; Rust 1.98.1.
-- The 23 lifecycle regressions also pass with Git LFS 3.8.1.
+- The lifecycle and publication regressions also pass with Git LFS 3.8.1.
 - Unmodified `git-lfs/lfs-test-server` at
   `d27ad23fddc1949ecd9a4ba6a3d074bc6a567084`.
 - Lifecycle regressions use the reference HTTP server in both suites. Other
@@ -30,25 +29,7 @@ git diff --check
 The CI workflow builds the pinned reference server and runs both transport
 suites, including the HTTP-only tests.
 
-## Results
-
-| Check | Result |
-|---|---|
-| Workspace regression suite | 209 passed, 0 failed; 2 HTTP-only tests ignored |
-| Full LFS suite with reference HTTP server | 88 passed, 0 failed, 0 ignored |
-| Warm-transfer regressions, file / HTTP | 4 passed / 4 passed |
-| Cold-mirror recovery budget regression | Passed |
-| Lifecycle regressions on Git LFS 3.8.1 | 23 passed, 0 failed |
-| Clippy, all targets, warnings denied | Passed |
-| Rust formatting | Passed |
-| Git whitespace checks | Passed |
-
-These counts describe test executions, not distinct proofs: the explicit
-reference-server test repeats the main history-recovery workflow. The original
-backend, core and server regression tests remain included in the workspace run.
-The complete-suite counts are from the prior full run. Subsequent batching and
-ref-query updates were checked with targeted warm-transfer, cold-mirror, and
-incremental-publication regressions.
+## Regression coverage
 
 Push-bookkeeping regressions cover destination-aware recipe scanning, one
 combined warm transfer within bounded 512-chunk groups, ancestry-cache reuse for
@@ -61,7 +42,7 @@ next ordinary-file push runs no CDC LFS upload, fast-import, or retention push.
 These are local regression measurements; production push time has not been
 measured with this implementation.
 
-### Incremental publication checks, October 27, 2026
+### Incremental publication
 
 With Git LFS 3.6.1 and the reference HTTP server, an ordinary-file push after
 80 MiB of CDC history completed in 145 ms with its local chunk cache removed.
@@ -86,19 +67,12 @@ three ordinary-file pushes without another CDC transfer or retention update.
 A subsequent mirror deletes individual ancestor refs while preserving every
 chunk through the remaining local descendant.
 
-### Publication regression checks, October 26, 2026
+### Cold-cache downloads
 
-With Git 2.47.3, all eight added publication regressions pass against both Git
-LFS 3.6.1 and 3.8.1. The earlier publication-only workspace run had five pending
-lifecycle failures; the completed cache adapter now makes all of them pass.
-The five cold-cache tests also pass with 3.6.1 against the reference HTTP server.
-
-An earlier HTTP run with 3.8.1, before the cache adapter, had 35 passing tests,
-two ignored tests and two failing cold-cache request-count assertions.
-These failures concern extra downloads. A separate 2 MiB metadata-only cold-push
-reproduction makes five extra object GET requests with both the previously
-installed CDC binary and the fixed binary, establishing that this behavior
-predates these publication fixes.
+A metadata-only cold push can download more objects than it needs: a 2 MiB
+reproduction makes five extra object GET requests. The same happens with
+binaries from before the publication changes, so it is not a regression from
+them.
 
 ## Behavior exercised
 

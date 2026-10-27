@@ -11,6 +11,17 @@ pub const MAX_PAYLOAD: usize = 65516;
 
 /// One packet: `Some(payload)` for data, `None` for flush.
 pub fn read_packet(reader: &mut impl Read) -> Result<Option<Vec<u8>>> {
+    let Some(len) = read_length(reader)? else {
+        return Ok(None);
+    };
+    let mut payload = vec![0u8; len];
+    reader
+        .read_exact(&mut payload)
+        .context("reading pkt-line payload")?;
+    Ok(Some(payload))
+}
+
+fn read_length(reader: &mut impl Read) -> Result<Option<usize>> {
     let mut prefix = [0u8; 4];
     reader
         .read_exact(&mut prefix)
@@ -24,13 +35,7 @@ pub fn read_packet(reader: &mut impl Read) -> Result<Option<Vec<u8>>> {
         0 => Ok(None), // flush
         1..=3 => bail!("invalid pkt-line length {len}"),
         _ if len - 4 > MAX_PAYLOAD => bail!("pkt-line payload {len} too large"),
-        _ => {
-            let mut payload = vec![0u8; len - 4];
-            reader
-                .read_exact(&mut payload)
-                .context("reading pkt-line payload")?;
-            Ok(Some(payload))
-        }
+        _ => Ok(Some(len - 4)),
     }
 }
 
@@ -56,7 +61,8 @@ pub fn write_text(writer: &mut impl Write, text: &str) -> Result<()> {
 
 pub fn read_text(reader: &mut impl Read) -> Result<Option<String>> {
     Ok(read_packet(reader)?.map(|p| {
-        let mut s = String::from_utf8_lossy(&p).into_owned();
+        let mut s = String::from_utf8(p)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         if s.ends_with('\n') {
             s.pop();
         }
@@ -65,11 +71,10 @@ pub fn read_text(reader: &mut impl Read) -> Result<Option<String>> {
 }
 
 /// `Read` over the content packets of one file, ending at the flush packet.
-/// Keeps memory bounded by packet size regardless of file size.
+/// Reads payloads directly into the caller's buffer without packet allocations.
 pub struct PktReader<'a, R: Read> {
     inner: &'a mut R,
-    buf: Vec<u8>,
-    pos: usize,
+    remaining: usize,
     done: bool,
 }
 
@@ -77,8 +82,7 @@ impl<'a, R: Read> PktReader<'a, R> {
     pub fn new(inner: &'a mut R) -> Self {
         PktReader {
             inner,
-            buf: Vec::new(),
-            pos: 0,
+            remaining: 0,
             done: false,
         }
     }
@@ -86,36 +90,28 @@ impl<'a, R: Read> PktReader<'a, R> {
     /// Consume any unread remainder through the terminating flush, so the
     /// stream is positioned for the next protocol message.
     pub fn drain(mut self) -> Result<()> {
-        while !self.done {
-            self.fill()?;
-            self.pos = self.buf.len();
-        }
-        Ok(())
-    }
-
-    fn fill(&mut self) -> Result<()> {
-        if self.pos == self.buf.len() && !self.done {
-            match read_packet(self.inner)? {
-                Some(payload) => {
-                    self.buf = payload;
-                    self.pos = 0;
-                }
-                None => self.done = true,
-            }
-        }
+        std::io::copy(&mut self, &mut std::io::sink())?;
         Ok(())
     }
 }
 
 impl<R: Read> Read for PktReader<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        self.fill().map_err(std::io::Error::other)?;
-        if self.pos == self.buf.len() {
-            return Ok(0); // flush reached
+        if out.is_empty() {
+            return Ok(0);
         }
-        let n = out.len().min(self.buf.len() - self.pos);
-        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
+        while self.remaining == 0 && !self.done {
+            match read_length(self.inner).map_err(std::io::Error::other)? {
+                Some(len) => self.remaining = len,
+                None => self.done = true,
+            }
+        }
+        if self.done {
+            return Ok(0);
+        }
+        let n = out.len().min(self.remaining);
+        self.inner.read_exact(&mut out[..n])?;
+        self.remaining -= n;
         Ok(n)
     }
 }
@@ -199,5 +195,34 @@ mod tests {
         assert!(read_packet(&mut &b"0001"[..]).is_err());
         assert!(read_packet(&mut &b"zzzz"[..]).is_err());
         assert!(read_packet(&mut &b"fff5"[..]).is_err()); // > MAX_PAYLOAD
+    }
+
+    #[test]
+    fn partial_packet_drain_stops_at_flush_and_skips_empty_packets() {
+        let mut wire = b"0004".to_vec(); // legal empty data packet
+        write_packet(&mut wire, b"content").unwrap();
+        write_flush(&mut wire).unwrap();
+        write_text(&mut wire, "next=message").unwrap();
+        let mut source = wire.as_slice();
+        let mut reader = PktReader::new(&mut source);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut head = [0; 2];
+        reader.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"co");
+        reader.drain().unwrap();
+        assert_eq!(
+            read_text(&mut source).unwrap().as_deref(),
+            Some("next=message")
+        );
+    }
+
+    #[test]
+    fn truncated_packet_is_an_error() {
+        let mut source = &b"0008abc"[..];
+        assert!(
+            PktReader::new(&mut source)
+                .read_to_end(&mut Vec::new())
+                .is_err()
+        );
     }
 }

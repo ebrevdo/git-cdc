@@ -1,7 +1,7 @@
 use std::io::Read;
 
 use anyhow::{Result, bail};
-use fastcdc::v2020::StreamCDC;
+use fastcdc::v2020::FastCDC;
 
 // DESIGN.md §4 default chunking parameters; override per repo with
 // `cdc.chunk.{min,avg,max}` git config.
@@ -70,37 +70,97 @@ pub struct Chunk {
 
 /// Chunk a stream with FastCDC. `sink` is called once per chunk with its raw
 /// bytes (store them, upload them — caller's choice), keeping memory bounded
-/// by MAX_SIZE instead of file size. Returns the chunk list, the whole-file
-/// BLAKE3 oid (computed in the same pass), and the total size.
+/// by the maximum chunk size instead of file size. Returns the chunk list,
+/// the whole-file BLAKE3 oid (computed in the same pass), and the total size.
 pub fn chunk_stream<R: Read>(
     reader: R,
     params: ChunkParams,
-    mut sink: impl FnMut(&Chunk, &[u8]) -> Result<()>,
+    sink: impl FnMut(&Chunk, &[u8]) -> Result<()>,
 ) -> Result<(Vec<Chunk>, blake3::Hash, u64)> {
-    let params = params.validate()?;
-    let mut chunks = Vec::new();
-    let mut file_hasher = blake3::Hasher::new();
-    let mut size: u64 = 0;
+    Chunker::default().chunk(reader, params, sink)
+}
 
-    for entry in StreamCDC::new(
-        reader,
-        params.min as usize,
-        params.avg as usize,
-        params.max as usize,
-    ) {
-        let entry = entry?;
-        let chunk = Chunk {
-            hash: blake3::hash(&entry.data),
-            offset: entry.offset,
-            length: entry.length as u32,
-        };
-        file_hasher.update(&entry.data);
-        size += entry.length as u64;
-        sink(&chunk, &entry.data)?;
-        chunks.push(chunk);
+/// Reusable streaming workspace. Tiny files need only a small buffer; larger
+/// files grow it up to two maximum-sized windows, amortizing compaction of
+/// the unconsumed tail. The sink borrows chunk bytes directly, avoiding
+/// StreamCDC's allocation and copy of every chunk.
+#[derive(Default)]
+pub struct Chunker {
+    buffer: Vec<u8>,
+}
+
+impl Chunker {
+    pub fn chunk(
+        &mut self,
+        mut reader: impl Read,
+        params: ChunkParams,
+        mut sink: impl FnMut(&Chunk, &[u8]) -> Result<()>,
+    ) -> Result<(Vec<Chunk>, blake3::Hash, u64)> {
+        let params = params.validate()?;
+        let max = params.max as usize;
+        let mut chunks = Vec::new();
+        let mut file_hasher = blake3::Hasher::new();
+        let mut size = 0;
+        let (mut start, mut end) = (0, 0);
+        let mut eof = false;
+
+        loop {
+            // A full maximum-sized window (or EOF) is required to preserve
+            // FastCDC boundaries regardless of how the reader splits input.
+            while end - start < max && !eof {
+                if end == self.buffer.len() {
+                    if start == end && start > 0 {
+                        start = 0;
+                        end = 0;
+                    } else if self.buffer.len() >= 2 * max {
+                        self.buffer.copy_within(start..end, 0);
+                        end -= start;
+                        start = 0;
+                    } else {
+                        let capacity = (self.buffer.len() * 2).max(8192).min(2 * max);
+                        self.buffer.reserve_exact(capacity - self.buffer.len());
+                        self.buffer.resize(capacity, 0);
+                    }
+                }
+                let limit = self.buffer.len().min(start + max);
+                match reader.read(&mut self.buffer[end..limit]) {
+                    Ok(0) => eof = true,
+                    Ok(n) => end += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if start == end {
+                break;
+            }
+            let length = FastCDC::new(
+                &self.buffer[start..end],
+                params.min as usize,
+                params.avg as usize,
+                max,
+            )
+            .next()
+            .unwrap()
+            .length;
+            let bytes = &self.buffer[start..start + length];
+            let chunk = Chunk {
+                hash: blake3::hash(bytes),
+                offset: size,
+                length: length as u32,
+            };
+            sink(&chunk, bytes)?;
+            chunks.push(chunk);
+            if eof && size == 0 && start + length == end {
+                // The overwhelmingly common tiny-file case: the chunk hash
+                // is already the whole-file hash.
+                return Ok((chunks, chunk.hash, length as u64));
+            }
+            file_hasher.update(bytes);
+            size += length as u64;
+            start += length;
+        }
+        Ok((chunks, file_hasher.finalize(), size))
     }
-
-    Ok((chunks, file_hasher.finalize(), size))
 }
 
 /// Test/bench helpers. Compiled unconditionally (not cfg(test)) so other
@@ -161,6 +221,85 @@ mod tests {
         assert!(chunks.is_empty());
         assert_eq!(size, 0);
         assert_eq!(oid, blake3::hash(&[]));
+    }
+
+    #[test]
+    fn reusable_workspace_matches_streamcdc_across_sizes_and_short_reads() {
+        use fastcdc::v2020::StreamCDC;
+
+        struct ShortReads<'a>(&'a [u8]);
+        impl Read for ShortReads<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let limit = out.len().min(997);
+                self.0.read(&mut out[..limit])
+            }
+        }
+
+        let data = test_data(20 * 1024 * 1024, 82);
+        let mut workspace = Chunker::default();
+        for params in [
+            ChunkParams::default(),
+            ChunkParams {
+                min: 64,
+                avg: 256,
+                max: 1024,
+            },
+            ChunkParams {
+                min: 1024,
+                avg: 4096,
+                max: 16385,
+            },
+        ] {
+            // Large -> tiny -> empty also exercises reuse without stale bytes.
+            for len in [data.len(), params.max as usize, 8192, 512, 0] {
+                let source = &data[..len];
+                let expected: Vec<_> = StreamCDC::new(
+                    source,
+                    params.min as usize,
+                    params.avg as usize,
+                    params.max as usize,
+                )
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    Chunk {
+                        hash: blake3::hash(&entry.data),
+                        offset: entry.offset,
+                        length: entry.length as u32,
+                    }
+                })
+                .collect();
+                let (actual, oid, size) = workspace
+                    .chunk(ShortReads(source), params, |c, bytes| {
+                        assert_eq!(bytes, &source[c.offset as usize..][..c.length as usize]);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(actual, expected, "params={params:?}, len={len}");
+                assert_eq!(oid, blake3::hash(source));
+                assert_eq!(size, len as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_growth_is_bounded_and_tiny_files_stay_small() {
+        let mut workspace = Chunker::default();
+        for _ in 0..100 {
+            workspace
+                .chunk(&[7u8; 512][..], ChunkParams::default(), |_, _| Ok(()))
+                .unwrap();
+            assert!(workspace.buffer.capacity() <= 8192);
+        }
+        let params = ChunkParams {
+            min: 1024,
+            avg: 4096,
+            max: 16385,
+        };
+        let mut workspace = Chunker::default();
+        workspace
+            .chunk(std::io::repeat(7).take(1024 * 1024), params, |_, _| Ok(()))
+            .unwrap();
+        assert!(workspace.buffer.capacity() <= 2 * params.max as usize);
     }
 
     #[test]

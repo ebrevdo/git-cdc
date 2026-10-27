@@ -1,10 +1,10 @@
 //! The clean/smudge filters: one-shot commands and the long-running
 //! filter-process protocol.
 
-use std::io::{BufReader, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
 use anyhow::{Result, bail};
-use git_cdc_core::chunker::{ChunkParams, chunk_stream};
+use git_cdc_core::chunker::{ChunkParams, Chunker};
 use git_cdc_core::manifest::Manifest;
 use git_cdc_core::store::{ChunkStore, DiskStore};
 
@@ -20,7 +20,8 @@ fn clean_stream(
     reader: impl Read,
     mut writer: impl Write,
     store: &DiskStore,
-    params: ChunkParams,
+    params: impl FnOnce() -> ChunkParams,
+    chunker: &mut Chunker,
 ) -> Result<()> {
     let mut reader = BufReader::with_capacity(64, reader);
     let (prefix, manifest) = read_candidate(&mut reader, false)?;
@@ -28,8 +29,9 @@ fn clean_stream(
         writer.write_all(&prefix)?;
         return Ok(());
     }
+    let params = params();
     let input = prefix.as_slice().chain(reader);
-    let (chunks, oid, size) = chunk_stream(input, params, |c, bytes| {
+    let (chunks, oid, size) = chunker.chunk(input, params, |c, bytes| {
         // The chunker already computed this hash from these bytes.
         if store.has(&c.hash) {
             Ok(())
@@ -79,8 +81,13 @@ pub fn cmd_clean(path: Option<&str>) -> Result<()> {
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();
     let mut params = ChunkParamsFor::new(chunk_params()?);
-    let params = params.get(path);
-    clean_stream(stdin, stdout, &local_store()?, params)
+    clean_stream(
+        stdin,
+        stdout,
+        &local_store()?,
+        || params.get(path),
+        &mut Chunker::default(),
+    )
 }
 
 pub fn cmd_smudge() -> Result<()> {
@@ -100,7 +107,7 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
     use git_cdc_core::pktline::{PktReader, PktWriter, read_text, write_flush, write_text};
 
     let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout().lock();
+    let mut output = BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
 
     // Handshake: welcome + version, then capability negotiation.
     match read_text(&mut input)?.as_deref() {
@@ -134,13 +141,17 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
     };
     // Per-path, so a tracked file keeps the parameters it was committed with
     // even when this clone's `cdc.chunk.*` says otherwise.
-    let mut params = ChunkParamsFor::new(chunk_params()?);
+    let mut params = ChunkParamsFor::for_process(chunk_params()?);
     let hydrate = crate::git::auto_hydrate()?;
+    let mut chunker = Chunker::default();
+    let mut result = tempfile::spooled_tempfile(64 * 1024);
+    let mut command = String::new();
+    let mut pathname = String::new();
 
     // Per-file loop: keys, flush, content packets, flush.
     loop {
-        let mut command = String::new();
-        let mut pathname = String::new();
+        command.clear();
+        pathname.clear();
         // Git signals it's done by closing stdin between files.
         let first = match read_text(&mut input) {
             Ok(line) => line,
@@ -155,8 +166,14 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
         let mut next = first;
         while let Some(line) = next {
             match line.split_once('=') {
-                Some(("command", v)) => command = v.to_string(),
-                Some(("pathname", v)) => pathname = v.to_string(),
+                Some(("command", v)) => {
+                    command.clear();
+                    command.push_str(v);
+                }
+                Some(("pathname", v)) => {
+                    pathname.clear();
+                    pathname.push_str(v);
+                }
                 _ => {} // unknown keys are fine per protocol
             }
             next = read_text(&mut input)?;
@@ -165,10 +182,15 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
             bail!("filter request without a command");
         }
 
-        // Spool to disk so failed verification becomes status=error without
-        // emitting partial content or retaining an entire file in RAM.
+        // Reuse RAM for small results. Large results spill to disk, so failed
+        // verification never emits partial content or holds a whole file in RAM.
         let mut content = PktReader::new(&mut input);
-        let mut result = tempfile::tempfile()?;
+        if result.is_rolled() {
+            result = tempfile::spooled_tempfile(64 * 1024);
+        } else {
+            result.set_len(0)?;
+            result.rewind()?;
+        }
         let outcome = match (command.as_str(), &store) {
             ("smudge", _) if !hydrate => std::io::copy(&mut content, &mut result)
                 .map(|_| ())
@@ -177,7 +199,8 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
                 &mut content,
                 &mut result,
                 store,
-                params.get(Some(pathname.as_str())),
+                || params.get(Some(pathname.as_str())),
+                &mut chunker,
             ),
             ("smudge", FilterStore::Lfs(store)) => {
                 crate::lfs::smudge(&mut content, &mut result, store)
@@ -186,7 +209,8 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
                 &mut content,
                 &mut result,
                 store,
-                params.get(Some(pathname.as_str())),
+                || params.get(Some(pathname.as_str())),
+                &mut chunker,
             ),
             ("smudge", FilterStore::Disk(store)) => smudge_stream(&mut content, &mut result, store),
             (other, _) => Err(anyhow::anyhow!("unsupported filter command {other:?}")),
@@ -197,10 +221,12 @@ pub fn cmd_filter_process(lfs: bool) -> Result<()> {
             Ok(()) => {
                 result.rewind()?;
                 write_text(&mut output, "status=success")?;
-                write_flush(&mut output)?;
+                output.write_all(b"0000")?;
                 std::io::copy(&mut result, &mut PktWriter::new(&mut output))?;
-                write_flush(&mut output)?;
-                write_flush(&mut output)?; // empty list: status unchanged
+                // Content flush, then an empty status list. Send the complete
+                // response together; Git doesn't need an intermediate flush.
+                output.write_all(b"00000000")?;
+                output.flush()?;
             }
             Err(e) => {
                 eprintln!("git-cdc: {pathname}: {e:#}");

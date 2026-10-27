@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
-use git_cdc_core::chunker::{Chunk, ChunkParams, chunk_stream};
+use git_cdc_core::chunker::{Chunk, ChunkParams, Chunker};
 use git_cdc_core::manifest::{Manifest, is_manifest};
 use sha2::{Digest, Sha256};
 
@@ -178,13 +178,17 @@ impl Store {
 
     fn lease(&self, oid: &str, exclusive: bool) -> Result<File> {
         let directory = self.root.join("locks");
-        fs::create_dir_all(&directory)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(directory.join(oid))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        let path = directory.join(oid);
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&directory)?;
+                options.open(path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         if exclusive {
             file.lock()?;
         } else {
@@ -220,20 +224,28 @@ impl Store {
         let oid = sha256(bytes);
         let _lease = self.lease(&oid, true)?;
         let path = self.path(&oid);
-        if path.is_file() {
-            // Do not trust an existing name: a previous disk error must be
-            // detected. A clean with known-good source bytes may repair it.
-            let mut old = Vec::with_capacity(bytes.len());
-            File::open(&path)?
-                .take(bytes.len() as u64 + 1)
-                .read_to_end(&mut old)?;
-            if old == bytes {
-                return Ok(oid);
+        match File::open(&path) {
+            Ok(file) => {
+                // Do not trust an existing name: a previous disk error must be
+                // detected. A clean with known-good source bytes may repair it.
+                let mut old = Vec::with_capacity(bytes.len());
+                file.take(bytes.len() as u64 + 1).read_to_end(&mut old)?;
+                if old == bytes {
+                    return Ok(oid);
+                }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let dir = path.parent().unwrap();
-        fs::create_dir_all(dir)?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        let mut tmp = match tempfile::NamedTempFile::new_in(dir) {
+            Ok(tmp) => tmp,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(dir)?;
+                tempfile::NamedTempFile::new_in(dir)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
         tmp.persist(&path).context("atomically storing LFS chunk")?;
@@ -319,7 +331,8 @@ pub(crate) fn clean(
     reader: impl Read,
     mut writer: impl Write,
     store: &Store,
-    params: ChunkParams,
+    params: impl FnOnce() -> ChunkParams,
+    chunker: &mut Chunker,
 ) -> Result<()> {
     let mut reader = BufReader::with_capacity(64, reader);
     let (prefix, manifest) = read_candidate(&mut reader, true)?;
@@ -327,17 +340,19 @@ pub(crate) fn clean(
         writer.write_all(&prefix)?;
         return Ok(());
     }
+    let params = params();
     let mut refs = BTreeMap::new();
     let mut count = 0usize;
-    let (chunks, oid, size) = chunk_stream(prefix.as_slice().chain(reader), params, |c, bytes| {
-        count += 1;
-        ensure!(
-            count <= MAX_CHUNKS,
-            "file exceeds the {MAX_CHUNKS}-chunk manifest limit"
-        );
-        refs.insert(lfs_key(c), store.put(bytes)?);
-        Ok(())
-    })?;
+    let (chunks, oid, size) =
+        chunker.chunk(prefix.as_slice().chain(reader), params, |c, bytes| {
+            count += 1;
+            ensure!(
+                count <= MAX_CHUNKS,
+                "file exceeds the {MAX_CHUNKS}-chunk manifest limit"
+            );
+            refs.insert(lfs_key(c), store.put(bytes)?);
+            Ok(())
+        })?;
     refs.insert("storage".into(), STORAGE.into());
     let mut m = Manifest::new(oid, size, chunks, params);
     m.extra = refs;
@@ -382,7 +397,8 @@ pub fn cmd_clean(path: Option<&str>) -> Result<()> {
         io::stdin().lock(),
         io::stdout().lock(),
         &Store::new()?,
-        params.get(path),
+        || params.get(path),
+        &mut Chunker::default(),
     )
 }
 
@@ -737,7 +753,8 @@ mod tests {
             &b"sample content"[..],
             &mut bytes,
             &store,
-            ChunkParams::default(),
+            ChunkParams::default,
+            &mut Chunker::default(),
         )
         .unwrap();
         parse(&bytes).unwrap()

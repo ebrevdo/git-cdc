@@ -53,7 +53,18 @@ git-cdc plugs into git's clean/smudge filter machinery, exactly like
 git-lfs — via the long-running **filter-process protocol**: git starts one
 `git-cdc filter-process` per operation and streams every tracked file
 through it over pkt-line framing, so a 500-file checkout costs one process,
-not 500 (one-shot `clean`/`smudge` remain as the git < 2.11 fallback):
+not 500 (one-shot `clean`/`smudge` remain as the git < 2.11 fallback).
+
+The process reuses its buffers from one file to the next, so tiny files need
+almost no extra work, and memory stays bounded by the chunk size rather than
+the file size. Each result is still verified in full before Git sees any of
+it. Looking up a tracked file's committed chunk parameters is one quick query
+per file for small operations; larger ones read the index once instead.
+
+Small files aren't padded: a 512-byte file becomes one 512-byte chunk (one
+512-byte LFS object with the LFS backend). Many tiny files still mean many
+stored objects, so they cost filesystem work even though chunking them is
+cheap.
 
 **clean** (runs on `git add` for tracked paths): reads file content from
 stdin, chunks it, writes each chunk into the local store, and emits the
