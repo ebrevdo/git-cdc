@@ -7,13 +7,6 @@ boundaries (FastCDC) and stores them in a content-addressable store keyed by
 BLAKE3. Edit 4 bytes in a 30 MiB file and only the one changed chunk (~2 MiB)
 is uploaded — the other ~14 are already on the server.
 
-An opt-in **standard Git LFS backend** stores those deduplicated chunks on an
-unmodified Git LFS server, using the same repository and ordinary Git commands.
-It automatically downloads on checkout and uploads before push. See the
-[LFS installation and usage guide](docs/book/src/lfs.md) for setup, binary
-staging/merge semantics, retention considerations, and Git's checkout memory
-limitation.
-
 ```text
 git add ──▶ clean filter ──▶ chunker ──▶ manifest (committed to git)
                  │
@@ -63,31 +56,6 @@ docker run -p 8077:8077 -v cdc-data:/data -e GIT_CDC_TOKEN=secret \
 ```
 
 ## Quick start
-
-### Standard Git LFS storage
-
-Install Git LFS 3.x and build this version of `git-cdc`, then configure once:
-
-```sh
-git cdc install --lfs --global
-```
-
-Inside your repository:
-
-```sh
-git cdc track --lfs '*.bin' '*.dat'
-git add .gitattributes model.bin
-git commit -m "Add model"
-git push origin main
-```
-
-Future clones on this computer materialize automatically. The pre-push hook
-uploads all chunks needed by the published history. No separate hydration or
-synchronization command is required. Existing hooks are preserved and chained.
-For repository-local setup, custom hook directories, and limitations, see the
-[complete guide](docs/book/src/lfs.md).
-
-### Original CDC server
 
 Run a chunk server somewhere (all state lives in `--root`):
 
@@ -160,6 +128,21 @@ The CLI runs `ssh user@host git-cdc stdio --root /srv/cdc-chunks` and
 speaks a pkt-line protocol over the pipe; your ssh config (keys, agents,
 jump hosts) applies as-is. Precedence: `cdc.store.scheme` >
 `cdc.ssh.remote` > `cdc.url`.
+
+### Git LFS backend (existing LFS server, no git-cdc server)
+
+Chunks can also be stored as ordinary objects on an unmodified Git LFS
+server. This uses its own filter, selected with `--lfs` (needs Git LFS 3.x):
+
+```sh
+git cdc install --lfs --global
+git cdc track --lfs '*.bin' '*.dat'
+git add .gitattributes model.bin && git commit -m "add model"
+git push                        # pre-push hook uploads chunks to the LFS server
+```
+
+Checkout downloads chunks automatically. For repository-local setup and
+limitations, see the [LFS guide](docs/book/src/lfs.md).
 
 ### Compression
 
@@ -280,29 +263,20 @@ write and read, and reassembled files are checked against the whole-file oid.
 
 | Command | What it does |
 |---|---|
-| `git cdc install [--global]` | Register the filter driver; local install also adds a pre-push hook |
-| `git cdc track <pattern>…` | Add patterns to `.gitattributes` |
+| `git cdc install [--global] [--lfs]` | Register the filter driver; local install also adds a pre-push hook; `--lfs` selects the Git LFS backend |
+| `git cdc track [--lfs] <pattern>…` | Add patterns to `.gitattributes` |
 | `git cdc push` | Upload chunks referenced by any local manifest (only ones the server is missing) |
 | `git cdc pull [<path>…]` | Fetch missing chunks for the current checkout and materialize files |
 | `git cdc gc [--dry-run] [--grace-secs N]` | Mark-and-sweep unreferenced chunks, locally and on the server |
-| `git cdc prune [--dry-run]` | Evict remotely backed CDC cache objects while preserving current indexes/checkouts, stashes, and unpushed history |
+| `git cdc prune [--dry-run]` | Delete local chunks the remote already has, keeping those needed by the checkout, stashes, or unpushed commits |
 | `git cdc drop [--chunks] [--dry-run] --all \| <path>…` | Reclaim local disk: collapse tracked files back to their manifest, optionally dropping local chunks the remote already has |
 | `git cdc diff [<a> <b>]` | Chunk-level changelist between two manifest files; with no arguments, every tracked file between HEAD and the index |
 
 ### Reclaiming local disk
 
-The commands below support both original CDC and standard LFS storage; see
-[CDC cache lifecycle](docs/cdc-cache-lifecycle.md). LFS eviction checks remote
-availability with stock Git LFS and verifies published retention roots.
-For `file://` LFS endpoints and custom standalone transfer agents, actual chunk
-eviction requires interactive confirmation because of Git LFS's known
-verification limitation; the default answer is No. Ordinary HTTP transfers
-do not require that confirmation.
-
 A tracked file costs local disk twice — the hydrated file in your
-worktree *plus* its chunks in `.git/cdc/objects` (original CDC) or the Git common
-directory's `cdc/lfs/objects` (LFS). `git cdc drop` gives
-both back:
+worktree *plus* its chunks in `.git/cdc/objects` (`.git/cdc/lfs/objects`
+with the LFS backend). `git cdc drop` gives both back:
 
 ```sh
 git cdc drop --chunks huge-dataset.bin   # one file

@@ -7,10 +7,10 @@
 - [Getting Started](getting-started.md)
 - [How It Works](how-it-works.md)
 - [Configuration](configuration.md)
-- [Standard Git LFS Storage](lfs.md)
 - [Serverless Mode](serverless.md)
 - [SSH Transport](ssh.md)
 - [Running a Server](server.md)
+- [Standard Git LFS Storage](lfs.md)
 - [Garbage Collection](gc.md)
 
 # Reference

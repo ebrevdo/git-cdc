@@ -126,6 +126,39 @@ their checkpoint succeeds. User hooks run with no chunk leases held.
 verification, transfers and retention, plus the stock LFS pre-push handler. It
 also reports how many chunk records came from the history metadata cache.
 
+## Hook installation and local cache
+
+A global install without an existing global `core.hooksPath` creates a managed
+directory and points `core.hooksPath` at it. That directory forwards Git's
+documented hook names (plus git-p4 hooks) to the repository's own hooks,
+preserving arguments, stdin, stdout, working directory, environment and exit
+status; non-executable hooks remain inactive, and the forwarding stubs perform
+no CDC storage work. Hooks already present in the active global directory are
+not replaced. A custom global hook directory keeps its own semantics; only
+pre-push is integrated there. Arbitrary hook names used with `git hook run`
+need a repository-local hooksPath and a local install.
+
+An existing pre-push hook in the installation directory is backed up and
+chained with the same arguments and input. Chained hooks resolve beside the
+installed wrapper, so repository-local hooks keep working after the repository
+is relocated. Unmodified stock Git LFS pre-push hooks are handled by the
+dispatcher's filtered LFS call instead of running twice. Existing
+reference-transaction hooks also see the internal local ref updates, so their
+policies must permit the reserved namespace.
+
+Each pre-push invocation binds transfers and retention publication to the
+destination Git supplies, including remotes with multiple push URLs; explicit
+LFS endpoint settings still apply. Replacement objects are ignored because Git
+publishes the original objects.
+
+The cache is the Git common directory's `cdc/lfs/objects`, using the standard
+LFS SHA-256 sharding layout. Each CDC transfer sets a relative
+`lfs.storage=cdc/lfs`, so the cache stays isolated from ordinary LFS objects
+and stock `git lfs prune` cannot discard unpublished CDC data whose recipes it
+does not understand. The repository's ordinary LFS cache configuration is
+unchanged. The standalone file transport consequently stores CDC objects under
+the target repository's `cdc/lfs/objects` as well.
+
 ## Failure and concurrency model
 
 Chunk writes use unique same-directory temporary files, file sync, atomic

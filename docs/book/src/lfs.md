@@ -1,254 +1,140 @@
 # Standard Git LFS storage
 
-The opt-in LFS backend keeps FastCDC chunking and deduplication, and uses the
-repository's existing, unmodified Git LFS server. It needs one Git repository,
-Git LFS 3.x, and `git-cdc` on each participating computer. No chunk server,
-extra repository, sidecar files, or server plugin is involved.
+The opt-in LFS backend keeps git-cdc's chunking and deduplication, but stores
+the chunks as ordinary objects on your repository's existing, unmodified Git
+LFS server. There is no git-cdc server, bucket, or extra repository. Every
+computer that works with the repository needs Git LFS 3.x and `git-cdc`.
 
-## Install and configure once
+## Setup
 
-Build the updated client from this source tree:
-
-```sh
-cargo install --path crates/cli --locked
-```
-
-Install Git LFS using your operating system's package manager. To enable CDC
-checkout and publication for existing and future clones on this computer:
+Install Git LFS with your package manager, then enable the backend for every
+repository on this computer:
 
 ```sh
 git cdc install --lfs --global
 ```
 
-This installs required `cdc-lfs` filters and a pre-push dispatcher. It sets a
-global `core.hooksPath` only if you do not already have one. The managed global
-directory forwards existing repository-local hooks, including commit, checkout,
-merge, reference-transaction and pre-push hooks. Arguments, stdin, stdout,
-working directory, environment and exit status are preserved; non-executable
-hooks remain inactive. These forwarding stubs perform no CDC storage work.
-An existing pre-push hook in the installation directory is backed up and
-chained with
-the same arguments and input; its veto runs before storage publication. Chained
-hooks are resolved beside the installed wrapper, so repository-local hooks
-continue to work after relocation. Unmodified stock Git LFS pre-push hooks are
-handled by the dispatcher's filtered LFS call instead of being run twice. Hooks
-already present in the active global directory are not replaced. Repositories
-with their own
-`core.hooksPath` need a one-time `git cdc install --lfs` in that repository so
-the active pre-push hook is integrated too.
+This registers the `cdc-lfs` filter and a pre-push hook. If you have no global
+`core.hooksPath`, it sets one to `~/.config/git-cdc/hooks`, and your
+repository-local hooks keep running from there; otherwise the pre-push hook is
+added to your existing hooks directory. An existing pre-push hook is
+kept as `pre-push.before-cdc-lfs` and runs first; if it rejects the push,
+nothing is uploaded. A repository with its own `core.hooksPath` needs a one-time
+`git cdc install --lfs` inside it.
 
-For repository-local installation instead, run `git cdc install --lfs` there.
-Git does not copy executable filters or hooks from a repository being cloned.
-Without the global installation, use `git clone --no-checkout`, install
-locally, then `git reset --hard HEAD` for the first checkout. Each new clone
-needs that initial local setup. Global installation avoids those per-clone
-steps. Use it when you want this integration available across your repositories.
-Existing local hooks continue through the managed global directory. A custom
-global hook directory retains its existing semantics; the installer integrates
-pre-push there without changing the other hooks. The managed forwarding list
-covers Git's documented hook names (plus git-p4 hooks). Arbitrary custom names
-used with `git hook run` require a repository-local hooksPath and local install.
+To set up a single repository instead, run `git cdc install --lfs` in it. Git
+does not copy filters or hooks into a clone, so without the global install
+each new clone needs:
 
-Inside the repository, select the files once:
+```sh
+git clone --no-checkout <url> repo && cd repo
+git cdc install --lfs
+git reset --hard HEAD           # first checkout, through the filter
+```
+
+## Tracking files
 
 ```sh
 git cdc track --lfs '*.bin' '*.dat'
-git add .gitattributes
-git add model.bin
-git commit -m 'Track model with deduplicated LFS storage'
-git push origin main
+git add .gitattributes model.bin
+git commit -m "add model"
+git push
 ```
 
-`install --lfs` also selects LFS as the default for subsequent `git cdc track`
-commands in its configuration scope. `track` edits only `.gitattributes`; it
-never stages it or any file. Existing files can be converted by staging them
-with `git add --renormalize <paths>` and committing the change. This converts
-the current snapshot, not old commits or their storage dependencies.
+After `install --lfs`, plain `git cdc track` defaults to LFS as well. `track`
+only edits `.gitattributes` and never stages anything. To convert files that
+are already committed, run `git add --renormalize <paths>` and commit; this
+converts the current snapshot, not older commits.
 
-Normal Git LFS endpoint discovery, `.lfsconfig`, remote-specific LFS URLs,
-Git credential helpers, and supported transports apply. A standard hosted LFS
-endpoint usually needs no additional configuration. With a custom endpoint,
-configure it in the usual way, for example:
+Ordinary Git LFS files (`filter=lfs`) can live alongside CDC files in the same
+repository.
+
+## Choosing the LFS server
+
+Normal Git LFS endpoint discovery applies, including `.lfsconfig`,
+remote-specific LFS URLs, and Git credential helpers. A hosted LFS endpoint
+usually needs no configuration. For a custom endpoint:
 
 ```sh
 git config -f .lfsconfig lfs.url https://example.com/repository/info/lfs
 git add .lfsconfig
-git commit -m 'Configure LFS endpoint'
+git commit -m "configure LFS endpoint"
 ```
 
-Commit credentials nowhere. Ordinary Git LFS files can coexist with CDC files;
-the pre-push dispatcher handles both.
+Never commit credentials. The server must also accept pushes to
+`refs/notes/git-cdc-lfs/` (see [Pushing](#pushing)).
 
 ## Everyday use
 
-Use `git add`, `status`, `diff`, `commit`, `push`, `clone`, `pull`, `checkout`,
-`switch`, and `restore` normally. The filter writes only the content-addressed
-cache. It never changes the index, refs, attributes, other tracked files, or
-untracked user files. The staged recipe represents exactly the bytes supplied
-to `git add`. Later edits remain unstaged, and alternate indexes work normally.
+Use `add`, `commit`, `checkout`, `switch`, `pull`, `push` and the rest of Git
+normally. Checkout downloads missing chunks and verifies them before writing
+the file. If content cannot be fetched (for example, while offline), the
+checkout fails rather than leaving a manifest in place.
 
-Checkout downloads missing chunks automatically, validates each SHA-256,
-BLAKE3 and length, validates the complete file's BLAKE3, and only then returns
-successful file content to Git. Errors fail the required filter instead of
-silently leaving a successful pointer checkout. Correct content cannot be
-reconstructed while offline if its chunks are absent.
+- **Diffs.** `git diff` and `git show` display reconstructed content for text
+  files; binary files show their size and a fingerprint. `git show HEAD:path`
+  prints the stored manifest; add `--textconv` to see the content.
+- **Merges.** CDC paths merge like binary files: concurrent edits to the same
+  file conflict, and you resolve the file and `git add` it.
+- **Partial staging.** Staging whole files, or a version of a file you keep
+  editing, works. `git add -p` does not offer hunks for CDC paths; track text
+  that needs hunk staging with plain Git.
+- **Manifests instead of content.** `git config cdc.hydrate false` leaves
+  manifests on checkout until you run `git cdc pull`.
 
-`git diff` and commit patch views such as `git show HEAD` display the
-reconstructed contents for text files.
-Binary diffs display the byte count and a whole-content fingerprint. These
-commands may download missing chunks. `--no-textconv` shows the stored recipe
-when diagnosing a repository.
-The raw object command `git show HEAD:path` also shows the stored recipe;
-use `git show --textconv HEAD:path` to request the original content.
+Chunks are cached in `.git/cdc/lfs/objects`, shared by linked worktrees and
+kept apart from the ordinary LFS cache so that `git lfs prune` never touches
+them. To reclaim disk:
 
-CDC-tracked paths have Git's binary merge policy. Independent paths merge as
-usual. Concurrent edits to the same path cause a conflict with Git's ordinary
-base/ours/theirs index stages. Resolve the actual file and `git add` it. Recipes
-are never merged line by line. Rebase, cherry-pick, revert, resets, detached
-HEAD and linked worktrees use these same index and filter semantics.
+- `git cdc drop --chunks <path>…` turns selected clean files back into
+  manifests and deletes their cached chunks.
+- `git cdc pull [<path>…]` brings them back.
+- `git cdc prune [--dry-run]` deletes cached chunks that only already-pushed
+  history needs, keeping those used by checkouts, stashes, and unpushed commits.
 
-Partial staging of **files and snapshots** works: stage some paths, or stage a
-version of a file and continue editing it before committing. Git cannot apply
-textconv hunks to an underlying transformed binary recipe. Therefore
-`git add -p` does not offer hunks for CDC paths. Track text requiring hunk
-staging with ordinary Git. The extension does not implement a custom patch or
-merge engine.
+Chunks are only deleted after the LFS server confirms it holds them. With a
+`file://` LFS endpoint or a custom standalone transfer agent, Git LFS cannot
+reliably confirm this, so `drop --chunks` and `prune` ask before deleting. The
+default answer is No, and non-interactive runs keep everything.
 
-Normal Git checkout and push handle synchronization automatically. Use
-`git cdc drop --chunks <path>` to replace selected clean files with their
-indexed recipes and evict eligible chunks, `git cdc pull [<path>...]` to
-restore them explicitly, and `git cdc prune` to reclaim remotely backed
-historical cache entries. Dry runs are available for drop and prune.
-`git config cdc.hydrate false` leaves recipes on checkout until explicit pull.
+## Pushing
 
-## Publication, recovery, and cache
+Before Git updates any remote refs, the pre-push hook uploads every chunk the
+pushed history needs that the LFS server does not already have. If an upload
+fails, the push fails. Later pushes only scan new history.
 
-Before Git publishes refs, the hook collects the chunks required by the complete
-ancestry of the actual tips supplied by Git, including tag-only history and
-detached-HEAD pushes. A local metadata cache lets later pushes scan only the
-history added since the cached tips. Cache loss, corruption, or unrelated history
-causes a full scan. Replacement objects are ignored because Git publishes the
-original objects. Each pre-push invocation binds transfers and retention
-publication to the destination supplied by Git, including remotes with multiple push URLs;
-explicit LFS endpoint settings still apply. It validates recipe structure and
-collects chunk IDs and sizes without reconstructing historical files.
-Whole-file hashes are computed when cleaning
-content and checked during checkout; push is not a full-history integrity audit.
-The hook negotiates through the installed Git LFS client before downloading
-content. Objects already at the destination need no local copy. Missing chunks
-are restored from the normal download remote, then the target if necessary.
-Cached and fetched chunks are checked before upload.
+The hook then pushes a small internal ref under `refs/notes/git-cdc-lfs/`. It
+holds ordinary LFS pointers to the uploaded chunks, so servers that delete
+unreferenced LFS objects keep them. Do not delete these refs. They appear in
+`git log --all` and mirror clones, but not in branch or tag lists.
 
-Transfers negotiate at most 128 objects at a time. Recovery batches are limited
-to 64 MiB of missing local content; an object larger than 64 MiB travels alone.
-Cached chunks and chunks already at the destination need no recovery budget.
-Pushes that recover no chunks combine their retention pointers into one root.
-A cold migration publishes checkpoints before evicting downloaded chunks to
-keep disk use bounded. Existing cache entries remain untouched. Each push
-discovers existing retention roots once; checkpoints extend the preceding root.
-Object leases coordinate readers, cleans and eviction across linked worktrees.
-Failures block user ref publication and can leave uploaded objects or completed
-retention roots. Retries negotiate again, without an 'already uploaded' ledger.
-The metadata cache records validated recipe information, never remote presence.
-Every push still checks all required chunks at its actual LFS destination.
+- `git push --dry-run` still uploads chunks and the internal ref, because Git
+  runs pre-push hooks for dry runs. It does not update branches or tags.
+- `GIT_CDC_TRACE=1 git push` prints timings for each phase of the hook.
 
-Use `GIT_CDC_TRACE=1 git push ...` to print phase timings for the stock LFS hook,
-history collection, local chunk verification, LFS transfers, retention discovery,
-and retention preparation/publication. History timings include the number of
-chunks reused from the metadata cache.
+## Limits
 
-After successful transfer, it publishes an internal retention root under
-`refs/notes/git-cdc-lfs/`. Its Git tree contains ordinary LFS pointers for the
-chunks, so standard collectors scanning all Git refs can discover them. Each
-new root keeps the previous remote roots as ancestors. Roots have immutable
-content-addressed names, allowing concurrent clones to publish safely. This
-also protects retention during `git push --mirror`, including deletion-only
-mirror updates from a normal clone. User commits and the index are unchanged;
-ordinary branch, tag, status and diff views do not show this namespace.
-Commands explicitly inspecting every ref, such as `git log --all`, can show it.
+- **Every pushing computer needs the hook.** `git push --no-verify`, hosting
+  APIs, or a computer without git-cdc can publish commits whose chunks were
+  never uploaded.
+- **Shallow clones cannot push** (except ref deletions) until
+  `git fetch --unshallow` succeeds.
+- **Server retention.** Chunks are protected on servers that keep LFS objects
+  reachable from any Git ref; GitLab's orphan cleanup and GitHub's retention
+  policy both fit this. Collectors that scan only branches and tags, or delete
+  objects regardless of references, are not covered. See the
+  [retention analysis](../../lfs-retention.md).
+- **No server-side cleanup.** git-cdc has no garbage collection for the LFS
+  server, and the internal retention refs grow with each push.
+- **No compression.** Chunks are stored raw, not zstd-compressed as with the
+  other backends.
+- **File size.** A file can have at most 65,536 chunks, roughly 128 GiB at the
+  default chunk size.
+- **Checkout memory.** The filter uses bounded memory and temporary disk about
+  the size of the file, but Git buffers filtered checkout output, so
+  `git checkout` memory still grows with file size.
+- **Existing history.** Commits made with another git-cdc backend stay there;
+  keep that backend configured to check them out. There is no migration.
 
-The user pre-push veto runs first. The storage-only nested push bypasses only
-the recursive client pre-push invocation; server-side hooks still run.
-Existing reference-transaction hooks also see the internal local ref updates,
-and their policies must permit the reserved namespace. If the
-server refuses the metadata refs, the user ref update fails too. Storage
-preparation can remain after a rejected or interrupted push. `git push --dry-run` can upload chunks and retention metadata because Git invokes
-pre-push during dry runs; it does not update user branch or tag refs.
-
-The local cache uses the Git common directory's `cdc/lfs/objects` with the
-standard LFS SHA-256 sharding layout. All linked worktrees share it. Chunks are
-written through unique temporary files, synced, and atomically replaced;
-existing cache data is verified. LFS transport is configured with relative
-`lfs.storage=cdc/lfs` for each CDC transfer. The cache is intentionally isolated
-from ordinary LFS objects so stock `git lfs prune` cannot discard unpublished
-CDC data whose recipes it does not understand. CDC overrides the local cache
-path for its own transfers; the repository's ordinary LFS cache configuration
-is unchanged. The standalone file transport consequently stores CDC objects
-under the target repository's `cdc/lfs/objects` as well.
-
-Deleting a working file or changing branches never deletes chunks. Local
-`git cdc prune` protects indexes/checkouts, stashes and unpushed history;
-`git cdc drop --chunks` selects current files explicitly. Eviction requires
-advertised retention roots and a successful stock Git LFS remote check.
-The check uses a disposable repository with an empty commit and sparse
-placeholders for candidate objects, so source retention rules cannot skip
-verification. No user refs or remote objects are changed by this check.
-`file://` LFS endpoints and custom standalone transfer agents require a warning
-and interactive confirmation before actual eviction because their stock
-verification can report false success. The default is No; unattended calls
-preserve the files and chunks. Ordinary HTTP transfers do not prompt.
-Dry runs and restoration do not ask for confirmation. Push also removes
-chunks it fetched after publishing their retention root. There is no CDC
-command for LFS server garbage collection.
-Full recovery needs the Git repository **and** its associated LFS objects,
-just as with normal Git LFS. Ordinary clones hydrate CDC files through the CDC
-filter. A mirror that includes the internal retention refs exposes ordinary
-LFS pointers to `git lfs fetch --all` and standard pointer discovery. Ordinary
-Git LFS commands do not reconstruct the CDC user-file recipes themselves.
-
-The server must permit reading and writing the internal notes refs and retain LFS objects rooted
-across all Git refs. GitLab's documented orphan cleanup uses that all-ref
-pointer model; GitHub documents retention even after pointers are removed.
-Collectors deliberately limited to branches or tags, and policies deleting
-objects regardless of reachability, are outside this guarantee. The LFS API
-alone does not define those policies. See [retention analysis and evidence](../../lfs-retention.md).
-The namespace is managed storage metadata; do not manually remove it. Retention
-metadata/refs can grow with pushes, and there is no retention-metadata GC yet.
-
-## Limits and tradeoffs
-
-- The hook is a client-side safety gate. `git push --no-verify`, disabling the
-  hook, direct plumbing/hosting APIs, or pushing from an unconfigured client can
-  bypass it. Git provides no client mechanism to prevent those bypasses on an
-  unmodified remote. Install the integration on every publishing computer.
-- A shallow repository cannot validate the complete published ancestry; the
-  hook refuses non-deletion pushes until `git fetch --unshallow` succeeds.
-- A cache miss scans metadata throughout reachable history for the supplied
-  tips. Incremental pushes reuse validated metadata for cached ancestors.
-  A cold push downloads only objects the destination needs, using bounded
-  batches. For HTTP/SSH, failed cold batches are split to identify missing
-  content through the stock client's exit status. This can add process and
-  negotiation overhead. A required object unavailable locally and from the
-  recovery remotes is an error.
-- Chunks use their raw bytes as LFS objects. Legacy CDC's zstd envelope is not
-  used; SHA-256 identity and deduplication remain stable across clients.
-- Manifests are limited to 65,536 chunks and 16 MiB. The default average chunk
-  size corresponds to roughly 128 GiB per file, with data-dependent variation.
-  The filter fails rather than exceeding the limit. Different chunk parameters
-  change that capacity. Existing tracked paths inherit their staged parameters.
-- Filter memory is bounded by the maximum chunk size and the capped recipe
-  metadata; reconstructed bytes spool to temporary disk before success. This
-  needs temporary disk space approximately equal to the reconstructed file.
-  **Git itself buffers filtered checkout output**, so total `git checkout`
-  memory can still grow with file size. Bounded total Git-command memory would
-  require a different integration or changes to Git. The tests distinguish the
-  bounded filter from the Git process.
-- A file beginning with a valid CDC manifest is interpreted as a recipe, matching
-  the existing pointer-style convention. Recipes should not be edited as data.
-- Legacy history remains in its original backend. This extension does not
-  migrate historical CDC objects to LFS or rewrite history. Keep that backend
-  and its filter configured for old legacy commits. Old clients do not provide
-  LFS recovery; collaborators must install this version.
-
-See [the format and design](../../lfs-design.md) and
-[verification results](../../lfs-verification.md) for implementation detail.
+For the recipe format and implementation, see the [design](../../lfs-design.md)
+and [verification results](../../lfs-verification.md).
